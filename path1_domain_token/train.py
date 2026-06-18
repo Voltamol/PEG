@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 from PEG_base import PEGConfig, PEGModel, train_peg
 from utils import load_word_ontology, build_slot_dataset, get_dataloaders, PHILOSOPHY_CORPUS
+from story_corpus import story_corpus
 
 # Import the domain token decoder (we'll define it here or in a separate file)
 # For simplicity, we'll include the class definition in this script.
@@ -108,13 +109,6 @@ if __name__ == "__main__":
     word_list = load_word_ontology(model, word_list_size=50000)
 
     # Two corpora
-    story_corpus = [
-        # Replace with your full 60-sentence Eldoria story
-        "Leo was a young adventurer from the village of Eldoria.",
-        "Mia was his best friend and the smartest person he knew.",
-        "Sam was their clumsy but loyal companion.",
-        # ... (you'll paste the full story here)
-    ]
     philo_corpus = PHILOSOPHY_CORPUS
 
     # Combine with domain labels: 0 = story, 1 = philosophy

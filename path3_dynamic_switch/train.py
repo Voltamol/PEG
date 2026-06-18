@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 from PEG_base import PEGConfig, PEGModel, train_peg, train_decoder
 from utils import load_word_ontology, get_nearest_word, PHILOSOPHY_CORPUS
 from PEG_base import TransformerSlotDecoder
+from story_corpus import story_corpus
 
 # We'll reuse the separate decoders training logic (Path 2) but then add switching logic.
 # So we can import from path2_separate_decoders.train_separate_decoders? To keep it simple, we replicate.
@@ -19,9 +20,6 @@ if __name__ == "__main__":
 
     word_list = load_word_ontology(model, word_list_size=50000)
 
-    story_corpus = [
-        # full story
-    ]
     philo_corpus = PHILOSOPHY_CORPUS
 
     # Train PEG on combined corpus

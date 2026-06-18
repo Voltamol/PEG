@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 import math
 import nltk
 from nltk.corpus import words as nltk_words
+from story_corpus import story_corpus
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -406,13 +407,7 @@ if __name__ == "__main__":
     word_list = load_word_ontology(model, word_list_size=50000)
 
     # 2. Load a corpus (you can replace this with any list of sentences)
-    longer_corpus = [
-        "Leo was a young adventurer from the village of Eldoria.",
-        "Mia was his best friend and the smartest person he knew.",
-        "Sam was their clumsy but loyal companion.",
-        # ... (full 60‑sentence story as in the notebook)
-    ]
-    # For brevity, I'm not pasting the entire 60‑sentence list here – but you can copy it from the notebook.
+    longer_corpus = story_corpus
 
     print(f"Training PEG on {len(longer_corpus)} sentences...")
     train_peg(model, longer_corpus, epochs=30)

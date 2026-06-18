@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 from PEG_base import PEGConfig, PEGModel, train_peg
 from utils import load_word_ontology, build_slot_dataset, get_dataloaders, PHILOSOPHY_CORPUS
 from PEG_base import TransformerSlotDecoder  # reuse the base decoder
+from story_corpus import story_corpus
 
 def train_separate_decoders(model, story_corpus, philo_corpus, tokenizer, device, epochs=30):
     # Build datasets separately
@@ -51,9 +52,6 @@ if __name__ == "__main__":
     word_list = load_word_ontology(model, word_list_size=50000)
 
     # Define corpora
-    story_corpus = [
-        # full story (same as before)
-    ]
     philo_corpus = PHILOSOPHY_CORPUS
 
     # Train PEG on combined corpus (or just story? For separate decoders we might want PEG to learn from both)

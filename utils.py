@@ -110,13 +110,15 @@ def get_dataloaders(dataset, batch_size=16, val_split=0.2, include_domain=False)
     def collate_fn(batch):
         if include_domain:
             slot_vecs = torch.stack([b[0] for b in batch])
-            tokens = [b[1] for b in batch]
+            # Convert token lists to tensors
+            tokens = [torch.tensor(b[1], dtype=torch.long) for b in batch]
             domains = torch.tensor([b[2] for b in batch], dtype=torch.long)
             tokens_pad = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=0)
             return slot_vecs, tokens_pad, domains
         else:
             slot_vecs = torch.stack([b[0] for b in batch])
-            tokens_pad = torch.nn.utils.rnn.pad_sequence([b[1] for b in batch], batch_first=True, padding_value=0)
+            tokens = [torch.tensor(b[1], dtype=torch.long) for b in batch]
+            tokens_pad = torch.nn.utils.rnn.pad_sequence(tokens, batch_first=True, padding_value=0)
             return slot_vecs, tokens_pad
 
     train_loader = DataLoader(SlotTextDataset(train_data), batch_size=batch_size,

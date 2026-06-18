@@ -5,13 +5,40 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from transformers import AutoTokenizer
-from PEG_base import PEGConfig, PEGModel, train_peg, train_decoder
-from utils import load_word_ontology, get_nearest_word, PHILOSOPHY_CORPUS
+from PEG_base import PEGConfig, PEGModel, train_peg, train_decoder, TransformerSlotDecoder
+from utils import load_word_ontology, get_nearest_word, build_slot_dataset, get_dataloaders, PHILOSOPHY_CORPUS
 from PEG_base import TransformerSlotDecoder
 from story_corpus import story_corpus
 
-# We'll reuse the separate decoders training logic (Path 2) but then add switching logic.
-# So we can import from path2_separate_decoders.train_separate_decoders? To keep it simple, we replicate.
+def train_separate_decoders(model, story_corpus, philo_corpus, tokenizer, device, config, epochs=30):
+    # Build datasets separately
+    story_data = build_slot_dataset(model, story_corpus, tokenizer, device)
+    philo_data = build_slot_dataset(model, philo_corpus, tokenizer, device)
+
+    train_loader_story, val_loader_story = get_dataloaders(story_data, batch_size=16)
+    train_loader_philo, val_loader_philo = get_dataloaders(philo_data, batch_size=16)
+
+    # Decoder for story
+    decoder_story = TransformerSlotDecoder(
+        slot_dim=config.d, d_model=256, nhead=4, num_layers=2,
+        dim_feedforward=512, vocab_size=tokenizer.vocab_size, max_len=50
+    ).to(device)
+
+    # Decoder for philosophy
+    decoder_philo = TransformerSlotDecoder(
+        slot_dim=config.d, d_model=256, nhead=4, num_layers=2,
+        dim_feedforward=512, vocab_size=tokenizer.vocab_size, max_len=50
+    ).to(device)
+
+    # Train story decoder
+    print("Training story decoder...")
+    train_decoder(decoder_story, train_loader_story, val_loader_story, epochs=epochs)
+
+    # Train philosophy decoder
+    print("Training philosophy decoder...")
+    train_decoder(decoder_philo, train_loader_philo, val_loader_philo, epochs=epochs)
+
+    return decoder_story, decoder_philo
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -29,10 +56,8 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
     tokenizer.pad_token = tokenizer.eos_token
 
-    # Build datasets separately (as in Path 2)
-    from path2_separate_decoders.train import train_separate_decoders
     decoder_story, decoder_philo = train_separate_decoders(
-        model, story_corpus, philo_corpus, tokenizer, device, epochs=30
+        model, story_corpus, philo_corpus, tokenizer, device, config, epochs=30
     )
 
     # Define a set of abstract words (to switch to philosophy decoder)
@@ -52,9 +77,15 @@ if __name__ == "__main__":
     raft_slot = None
     for slot in model.active_slots:
         label = get_nearest_word(slot.vec, model, word_list)
-        if label == 'raft':
+        if 'raft' in label.lower():
             raft_slot = slot
+            print(f"Found slot labelled '{label}' (contains 'raft')")
             break
+
+    if raft_slot is None:
+        raft_slot = model.active_slots[0] if model.active_slots else None
+        if raft_slot:
+            print(f"No 'raft' slot found, using first slot with label '{get_nearest_word(raft_slot.vec, model, word_list)}'")
 
     if raft_slot:
         decoder_story.eval()

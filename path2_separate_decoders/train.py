@@ -68,12 +68,19 @@ if __name__ == "__main__":
     )
 
     # Test generation
-    # Find raft slot
+    # Find a slot whose label contains 'raft'
     raft_slot = None
     for slot in model.active_slots:
-        if get_nearest_word(slot.vec, model, word_list) == 'raft':
+        label = get_nearest_word(slot.vec, model, word_list)
+        if 'raft' in label.lower():
             raft_slot = slot
+            print(f"Found slot labelled '{label}' (contains 'raft')")
             break
+
+    if raft_slot is None:
+        raft_slot = model.active_slots[0] if model.active_slots else None
+        if raft_slot:
+            print(f"No 'raft' slot found, using first slot with label '{get_nearest_word(raft_slot.vec, model, word_list)}'")
 
     if raft_slot:
         decoder_story.eval()

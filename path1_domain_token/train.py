@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from PEG_base import PEGConfig, PEGModel, train_peg
-from utils import load_word_ontology, build_slot_dataset, get_dataloaders, PHILOSOPHY_CORPUS
+from utils import load_word_ontology, build_slot_dataset, get_dataloaders, PHILOSOPHY_CORPUS, get_nearest_word
 from story_corpus import story_corpus
 
 # Import the domain token decoder (we'll define it here or in a separate file)

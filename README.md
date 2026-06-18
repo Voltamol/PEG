@@ -59,20 +59,18 @@ Use PEG's grounding ontology to **automatically detect** whether a slot is concr
 - `train.py` — Scripts for training and evaluating the four pathways.
 - `data/` — Sample datasets (Eldoria stories, philosophy aphorisms).
 
-## Getting Started
 
-```bash
-# Clone the repo
-git clone https://github.com/yourusername/peg-ai.git
-cd peg-ai
+## The Philosophy
 
-# Install dependencies
-pip install torch sentence-transformers transformers nltk
+> *"The best way to predict the future is to invent it."* — Alan Kay
 
-# Run the baseline (Path 1)
-python train.py --mode baseline
+This project was born from a refusal to accept that intelligence must be expensive, massive, and locked behind token limits. It's a proof that one person with a "crazy idea" can build something that works.
 
-# Test multi-domain pathways
-python train.py --mode domain_token    # Path 2
-python train.py --mode separate_decoders  # Path 3
-python train.py --mode dynamic_switch  # Path 4
+## License
+
+MIT — Open, accessible, and free for everyone.
+
+---
+
+*Hats off to the late-night debug sessions, the `IndexError` hunts, and the willingness to tolerate "crazy" ideas.* 🍻
+```

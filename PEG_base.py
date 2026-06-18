@@ -20,9 +20,39 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 import math
+import re
 import nltk
 from nltk.corpus import words as nltk_words
-from story_corpus import story_corpus
+
+#------------- ALICE IN WONDERLAND -------------------------------------
+def load_sentence_corpus(file_path: str) -> List[str]:
+    with open(file_path, encoding="utf-8") as corpus_file:
+        text = corpus_file.read()
+
+    text = re.sub(
+        r".*?(Alice was beginning to get very tired.*?)",
+        r"\1",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"\*\*\* END OF THE PROJECT GUTENBERG EBOOK.*",
+        "",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    normalized_text = re.sub(r"\s+", " ", text).strip()
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", normalized_text)
+        if sentence.strip()
+    ]
+
+
+story_corpus = load_sentence_corpus("Alice's adventures in Wonderland.txt")
 
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION

@@ -1,0 +1,468 @@
+# -*- coding: utf-8 -*-
+"""
+PEG — Predictive Energy Grounding with Transformer Decoder
+
+This script implements:
+1. PEG: unsupervised slot learning from text (predictive coding with energy-based memory).
+2. Transformer decoder with cross‑attention: generates text from any learned slot.
+
+All hyperparameters are centralised in PEGConfig. 
+The ontology is built from real word embeddings (using SentenceTransformer and nltk words).
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer
+from torch.utils.data import Dataset, DataLoader
+import math
+import nltk
+from nltk.corpus import words as nltk_words
+
+# ----------------------------------------------------------------------
+# 1. CONFIGURATION
+# ----------------------------------------------------------------------
+@dataclass
+class PEGConfig:
+    d: int = 256                     # latent dimension
+    hidden_size: int = 512           # MLP hidden size (Predictor)
+    gamma: float = 0.995             # energy decay
+    alpha: float = 0.1               # energy boost
+    beta: float = 0.05               # lateral inhibition
+    theta_high: float = 0.25         # surprise threshold for spawning
+    theta_novel: float = 0.4         # novelty threshold (residual norm)
+    theta_arch: float = 0.05         # archival threshold
+    lambda_pred: float = 1.0         # predictive loss weight
+    ontology_size: int = 50000       # number of words in ontology
+
+# ----------------------------------------------------------------------
+# 2. PEG MODEL (Predictive Energy Grounding)
+# ----------------------------------------------------------------------
+class ResidualProjection(nn.Module):
+    def __init__(self, d: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.eye(d) * 0.9 + torch.randn(d, d) * 0.01)
+        self.bias = nn.Parameter(torch.zeros(d))
+    def forward(self, x):
+        return F.linear(x, self.weight, self.bias)
+
+class PredictiveModule(nn.Module):
+    def __init__(self, config: PEGConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(config.d, config.hidden_size)
+        self.fc2 = nn.Linear(config.hidden_size, config.d)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+    def forward(self, context):
+        return self.fc2(F.gelu(self.fc1(context)))
+
+@dataclass
+class Slot:
+    vec: torch.Tensor
+    energy: float = 0.8
+    age: int = 0
+    anchor_idx: int = -1
+    def __eq__(self, other):
+        return isinstance(other, Slot) and id(self) == id(other)
+
+class PEGModel(nn.Module):
+    def __init__(self, config: PEGConfig, device='cpu'):
+        super().__init__()
+        self.config = config
+        self.device = device
+
+        # Frozen encoder (SentenceTransformer)
+        self.encoder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+        self.encoder.eval()
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        self.embed_dim = self.encoder.get_embedding_dimension()
+        self.proj_to_d = nn.Linear(self.embed_dim, config.d) if self.embed_dim != config.d else nn.Identity()
+
+        # Frozen ontology (will be replaced with real embeddings)
+        self.register_buffer('ontology', F.normalize(torch.randn(config.ontology_size, config.d), dim=-1))
+
+        # Trainable modules
+        self.P = PredictiveModule(config)
+        self.Psi = ResidualProjection(config.d)
+        self.ghost = nn.Parameter(torch.zeros(config.d))
+        nn.init.normal_(self.ghost, mean=0, std=0.01)
+
+        self.active_slots: List[Slot] = []
+        self.to(device)
+
+    # ---- helpers ----
+    def _anchor(self, z):
+        z_norm = F.normalize(z.unsqueeze(0), dim=-1)
+        sims = z_norm @ self.ontology.T
+        idx = min(sims.argmax(dim=-1).item(), self.ontology.shape[0] - 1)
+        return self.ontology[idx], sims[0, idx].item()
+
+    def _spawn_slot(self, z):
+        anchor_vec, sim = self._anchor(z)
+        if sim > 0.6:
+            vec = self.Psi(anchor_vec)
+            anchor_idx = (z @ self.ontology.T).argmax().item()
+        else:
+            ghost_proj = self.Psi(self.ghost)
+            vec = ghost_proj + (z - ghost_proj)
+            anchor_idx = -1
+        if self.active_slots:
+            avg_norm = torch.mean(torch.stack([s.vec.norm() for s in self.active_slots]))
+            vec = vec / vec.norm() * avg_norm
+        return Slot(vec=vec.detach(), energy=0.8, age=0, anchor_idx=anchor_idx)
+
+    def _soft_bind(self, z, slots):
+        if not slots:
+            return z, []
+        slot_vecs = torch.stack([s.vec for s in slots]).to(self.device)
+        z_norm = F.normalize(z.unsqueeze(0), dim=-1)
+        scores = (z_norm @ F.normalize(slot_vecs, dim=-1).T).squeeze(0)
+        weights = F.softmax(scores / 0.1, dim=0)
+        top_vals, top_idx = torch.topk(weights, min(2, len(weights)))
+        for i, w in zip(top_idx, top_vals):
+            if w > 0.1:
+                slots[i].vec += 0.01 * w * (z - slots[i].vec)
+                slots[i].vec = slots[i].vec / slots[i].vec.norm() * 1.0
+        z_explained = torch.sum(weights.unsqueeze(1) * slot_vecs, dim=0)
+        return z - z_explained, weights.tolist()
+
+    def _update_energy(self, binding_weights):
+        for slot in self.active_slots:
+            slot.energy *= self.config.gamma
+        for weights in binding_weights:
+            for slot, w in zip(self.active_slots, weights):
+                if w > 0.1:
+                    slot.energy += self.config.alpha * (1 - slot.energy)
+                    slot.age += 1
+        for i, s1 in enumerate(self.active_slots):
+            for j, s2 in enumerate(self.active_slots):
+                if i != j:
+                    sim = F.cosine_similarity(s1.vec.unsqueeze(0), s2.vec.unsqueeze(0)).item()
+                    if sim > 0.8:
+                        s2.energy -= self.config.beta * s2.energy
+        for slot in self.active_slots:
+            slot.energy = max(0.0, min(1.0, slot.energy))
+        # merge similar
+        to_merge = set()
+        for i in range(len(self.active_slots)):
+            for j in range(i+1, len(self.active_slots)):
+                sim = F.cosine_similarity(self.active_slots[i].vec.unsqueeze(0),
+                                          self.active_slots[j].vec.unsqueeze(0)).item()
+                if sim > 0.95:
+                    to_merge.add((i, j))
+        for i, j in to_merge:
+            s1, s2 = self.active_slots[i], self.active_slots[j]
+            merged_vec = (s1.vec * s1.energy + s2.vec * s2.energy) / (s1.energy + s2.energy + 1e-8)
+            merged_energy = max(s1.energy, s2.energy)
+            self.active_slots[i] = Slot(vec=merged_vec, energy=merged_energy, age=0)
+            del self.active_slots[j]
+        # archive low-energy
+        to_archive = [s for s in self.active_slots if s.energy < self.config.theta_arch and s.age > 50]
+        for slot in to_archive:
+            self.active_slots.remove(slot)
+
+    # ---- forward ----
+    def forward(self, sentences: List[str], next_sentences: List[str]) -> Dict[str, torch.Tensor]:
+        batch_size = len(sentences)
+        with torch.no_grad():
+            z_t = self.proj_to_d(torch.tensor(self.encoder.encode(sentences), device=self.device))
+            z_t_next = self.proj_to_d(torch.tensor(self.encoder.encode(next_sentences), device=self.device))
+
+        # context
+        if self.active_slots:
+            energies = torch.tensor([s.energy for s in self.active_slots], device=self.device)
+            weights = F.softmax(energies, dim=0)
+            context = torch.sum(weights.unsqueeze(1) * torch.stack([s.vec for s in self.active_slots]), dim=0)
+        else:
+            context = torch.zeros(self.config.d, device=self.device)
+
+        z_pred = self.P(context)
+        z_pred_norm = F.normalize(z_pred.unsqueeze(0), dim=-1)
+        z_t_norm = F.normalize(z_t, dim=-1)
+        cosine_sim = (z_pred_norm @ z_t_norm.T).diag()
+        surprise = 1 - cosine_sim
+        avg_surprise = surprise.mean()
+
+        all_residuals, all_weights = [], []
+        for z in z_t:
+            z_res, w = self._soft_bind(z, self.active_slots)
+            all_residuals.append(z_res)
+            all_weights.append(w)
+
+        spawned = False
+        for z, z_res, s in zip(z_t, all_residuals, surprise):
+            if z_res.norm().item() > self.config.theta_novel and s > self.config.theta_high:
+                self.active_slots.append(self._spawn_slot(z))
+                spawned = True
+
+        L_pred = F.mse_loss(z_pred.unsqueeze(0).expand(batch_size, -1), z_t_next)
+        total_loss = self.config.lambda_pred * L_pred
+        self._update_energy(all_weights)
+
+        return {'loss': total_loss, 'pred_loss': L_pred, 'surprise': avg_surprise,
+                'n_slots': len(self.active_slots), 'spawned': spawned}
+
+    @torch.no_grad()
+    def predict_next(self, sentence: str) -> torch.Tensor:
+        z = self.proj_to_d(torch.tensor(self.encoder.encode([sentence]), device=self.device)).squeeze(0)
+        if self.active_slots:
+            energies = torch.tensor([s.energy for s in self.active_slots], device=self.device)
+            weights = F.softmax(energies, dim=0)
+            context = torch.sum(weights.unsqueeze(1) * torch.stack([s.vec for s in self.active_slots]), dim=0)
+        else:
+            context = torch.zeros(self.config.d, device=self.device)
+        return self.P(context)
+
+# ----------------------------------------------------------------------
+# 3. ONTOLOGY LOADING (REAL WORD EMBEDDINGS)
+# ----------------------------------------------------------------------
+def load_word_ontology(model: PEGModel, word_list_size=50000, batch_size=256):
+    """Build ontology matrix from nltk words using the model's encoder."""
+    nltk.download('words', quiet=True)
+    words = nltk_words.words()
+    words = list(set([w.lower() for w in words if w.isalpha()]))[:word_list_size]
+    print(f"Loaded {len(words)} words for ontology.")
+
+    # embed in batches
+    embeddings = []
+    for i in range(0, len(words), batch_size):
+        batch = words[i:i+batch_size]
+        emb = model.encoder.encode(batch, convert_to_tensor=True)
+        embeddings.append(emb.cpu())
+    emb_all = torch.cat(embeddings, dim=0)
+    emb_all = F.normalize(emb_all, dim=-1)
+    # project to model's latent dimension
+    emb_all = model.proj_to_d(emb_all.to(model.device))
+    model.ontology = emb_all
+    print(f"Ontology shape: {model.ontology.shape}")
+    return words
+
+# ----------------------------------------------------------------------
+# 4. TRANSFORMER DECODER (SLOT → TEXT)
+# ----------------------------------------------------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=1000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+class TransformerSlotDecoder(nn.Module):
+    def __init__(self, slot_dim=256, d_model=256, nhead=4, num_layers=2,
+                 dim_feedforward=512, vocab_size=30522, max_len=50):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        self.vocab_size = vocab_size
+        self.slot_proj = nn.Linear(slot_dim, d_model)
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, max_len)
+        decoder_layer = nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, batch_first=True)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
+        self.fc_out = nn.Linear(d_model, vocab_size)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, slot_vec, target_tokens=None, teacher_forcing_ratio=0.5, max_len=None):
+        batch_size = slot_vec.size(0)
+        max_len = max_len or self.max_len
+        memory = self.slot_proj(slot_vec).unsqueeze(1)  # (batch, 1, d_model)
+
+        if target_tokens is not None:
+            # training
+            tgt_input = target_tokens[:, :-1]
+            tgt_emb = self.pos_encoder(self.embedding(tgt_input))
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_emb.size(1), device=slot_vec.device)
+            output = self.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+            logits = self.fc_out(output)
+            loss = F.cross_entropy(logits.reshape(-1, self.vocab_size),
+                                   target_tokens[:, 1:].reshape(-1),
+                                   ignore_index=0)
+            return loss
+        else:
+            # inference
+            generated = torch.full((batch_size, 1), tokenizer.cls_token_id, dtype=torch.long, device=slot_vec.device)
+            for _ in range(max_len - 1):
+                tgt_emb = self.pos_encoder(self.embedding(generated))
+                tgt_mask = nn.Transformer.generate_square_subsequent_mask(generated.size(1), device=slot_vec.device)
+                output = self.decoder(tgt_emb, memory, tgt_mask=tgt_mask)
+                logits = self.fc_out(output[:, -1, :])
+                next_token = logits.argmax(dim=-1).unsqueeze(1)
+                generated = torch.cat([generated, next_token], dim=1)
+                if (next_token == tokenizer.sep_token_id).all():
+                    break
+            return generated
+
+# ----------------------------------------------------------------------
+# 5. DATASET UTILITY (slot → sentence pairs)
+# ----------------------------------------------------------------------
+class SlotTextDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        slot_vec, tokens = self.data[idx]
+        return slot_vec, torch.tensor(tokens, dtype=torch.long)
+
+def build_slot_dataset(model, corpus, tokenizer, device):
+    """For each sentence, find the closest slot and store (slot_vec, token_ids)."""
+    dataset = []
+    for sent in corpus:
+        with torch.no_grad():
+            z = model.proj_to_d(torch.tensor(model.encoder.encode([sent]), device=device)).squeeze(0)
+            if not model.active_slots:
+                continue
+            slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)
+            sims = F.cosine_similarity(z.unsqueeze(0), slot_vecs, dim=1)
+            best_idx = sims.argmax().item()
+            slot_vec = model.active_slots[best_idx].vec
+        tokens = tokenizer.encode(sent, add_special_tokens=True)
+        dataset.append((slot_vec.cpu(), tokens))
+    return dataset
+
+def get_dataloaders(dataset, batch_size=16, val_split=0.2):
+    split = int((1 - val_split) * len(dataset))
+    train_data = dataset[:split]
+    val_data = dataset[split:]
+    collate_fn = lambda batch: (
+        torch.stack([b[0] for b in batch]),
+        torch.nn.utils.rnn.pad_sequence([b[1] for b in batch], batch_first=True, padding_value=0)
+    )
+    train_loader = DataLoader(SlotTextDataset(train_data), batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(SlotTextDataset(val_data), batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    return train_loader, val_loader
+
+# ----------------------------------------------------------------------
+# 6. TRAINING ROUTINES
+# ----------------------------------------------------------------------
+def train_peg(model, corpus, epochs=30, lr=1e-3):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # seed first slot
+    with torch.no_grad():
+        z0 = model.proj_to_d(torch.tensor(model.encoder.encode([corpus[0]]), device=model.device)).squeeze(0)
+        model.active_slots.append(model._spawn_slot(z0))
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for i in range(len(corpus)-1):
+            loss_dict = model([corpus[i]], [corpus[i+1]])
+            loss = loss_dict['loss']
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        avg_loss = total_loss / (len(corpus)-1)
+        print(f"PEG Epoch {epoch:02d} | loss={avg_loss:.4f} | slots={len(model.active_slots)}")
+    print("PEG training complete.")
+
+def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3):
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
+    for epoch in range(epochs):
+        decoder.train()
+        total_loss = 0
+        for slot_vecs, target_tokens in train_loader:
+            slot_vecs = slot_vecs.to(decoder.fc_out.weight.device)
+            target_tokens = target_tokens.to(decoder.fc_out.weight.device)
+            loss = decoder(slot_vecs, target_tokens, teacher_forcing_ratio=0.5)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        avg_train = total_loss / len(train_loader)
+        decoder.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for slot_vecs, target_tokens in val_loader:
+                slot_vecs = slot_vecs.to(decoder.fc_out.weight.device)
+                target_tokens = target_tokens.to(decoder.fc_out.weight.device)
+                loss = decoder(slot_vecs, target_tokens, teacher_forcing_ratio=0.0)
+                val_loss += loss.item()
+        avg_val = val_loss / len(val_loader)
+        print(f"Decoder Epoch {epoch:02d} | train loss={avg_train:.4f} | val loss={avg_val:.4f}")
+    print("Decoder training complete.")
+
+# ----------------------------------------------------------------------
+# 7. DEMO SCRIPT
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = PEGConfig()
+    model = PEGModel(config, device=str(device))
+
+    # 1. Build real ontology
+    word_list = load_word_ontology(model, word_list_size=50000)
+
+    # 2. Load a corpus (you can replace this with any list of sentences)
+    longer_corpus = [
+        "Leo was a young adventurer from the village of Eldoria.",
+        "Mia was his best friend and the smartest person he knew.",
+        "Sam was their clumsy but loyal companion.",
+        # ... (full 60‑sentence story as in the notebook)
+    ]
+    # For brevity, I'm not pasting the entire 60‑sentence list here – but you can copy it from the notebook.
+
+    print(f"Training PEG on {len(longer_corpus)} sentences...")
+    train_peg(model, longer_corpus, epochs=30)
+
+    # 3. Build slot-to-sentence dataset for decoder
+    tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
+    tokenizer.pad_token = tokenizer.eos_token
+
+    slot_dataset = build_slot_dataset(model, longer_corpus, tokenizer, device)
+    train_loader, val_loader = get_dataloaders(slot_dataset, batch_size=16)
+
+    # 4. Train transformer decoder
+    decoder = TransformerSlotDecoder(
+        slot_dim=config.d,
+        d_model=256,
+        nhead=4,
+        num_layers=2,
+        dim_feedforward=512,
+        vocab_size=tokenizer.vocab_size,
+        max_len=50
+    ).to(device)
+
+    train_decoder(decoder, train_loader, val_loader, epochs=30)
+
+    # 5. Test generation from a specific slot (e.g., 'raft')
+    raft_slot = None
+    with torch.no_grad():
+        for slot in model.active_slots:
+            slot_norm = F.normalize(slot.vec.unsqueeze(0), dim=-1)
+            sims = slot_norm @ F.normalize(model.ontology, dim=-1).T
+            if word_list[sims.argmax().item()] == 'raft':
+                raft_slot = slot
+                break
+
+    if raft_slot:
+        decoder.eval()
+        with torch.no_grad():
+            tokens = decoder(raft_slot.vec.unsqueeze(0).to(device), target_tokens=None, max_len=30)
+            print("Generated from 'raft' slot:")
+            print(tokenizer.decode(tokens[0].cpu().numpy(), skip_special_tokens=True))
+    else:
+        print("No slot labelled 'raft' found.")
+
+    # Also test on an arbitrary sentence's slot
+    test_sent = "Leo spotted a broken rope bridge on the other side."
+    with torch.no_grad():
+        z = model.proj_to_d(torch.tensor(model.encoder.encode([test_sent]), device=device)).squeeze(0)
+        slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)
+        sims = F.cosine_similarity(z.unsqueeze(0), slot_vecs, dim=1)
+        best_vec = model.active_slots[sims.argmax().item()].vec
+    tokens = decoder(best_vec.unsqueeze(0).to(device), target_tokens=None, max_len=30)
+    print(f"Generated from slot of: '{test_sent}'")
+    print(tokenizer.decode(tokens[0].cpu().numpy(), skip_special_tokens=True))

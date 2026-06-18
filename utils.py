@@ -1,14 +1,18 @@
 # utils.py
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 import nltk
 from nltk.corpus import words as nltk_words
 import math
+from typing import List, Tuple, Optional
 
+# ----------------------------------------------------------------------
+# Positional Encoding (used by decoders)
+# ----------------------------------------------------------------------
 class PositionalEncoding(nn.Module):
-    # Same as in PEG_base – keep it here to avoid duplication
     def __init__(self, d_model, max_len=1000):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
@@ -16,23 +20,28 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
         return x + self.pe[:, :x.size(1), :]
 
 
+# ----------------------------------------------------------------------
+# Dataset class
+# ----------------------------------------------------------------------
 class SlotTextDataset(Dataset):
     def __init__(self, data):
-        self.data = data
+        self.data = data  # list of (slot_vec, tokens) or (slot_vec, tokens, domain_id)
     def __len__(self):
         return len(self.data)
     def __getitem__(self, idx):
-        slot_vec, tokens = self.data[idx]
-        return slot_vec, torch.tensor(tokens, dtype=torch.long)
+        return self.data[idx]
 
 
+# ----------------------------------------------------------------------
+# Ontology loading
+# ----------------------------------------------------------------------
 def load_word_ontology(model, word_list_size=50000, batch_size=256):
     """Build ontology matrix from nltk words using the model's encoder."""
     nltk.download('words', quiet=True)
@@ -52,6 +61,9 @@ def load_word_ontology(model, word_list_size=50000, batch_size=256):
     return words
 
 
+# ----------------------------------------------------------------------
+# Nearest word utility
+# ----------------------------------------------------------------------
 def get_nearest_word(slot_vec, model, word_list):
     """Return the nearest ontology word for a given slot vector."""
     with torch.no_grad():
@@ -61,10 +73,13 @@ def get_nearest_word(slot_vec, model, word_list):
         return word_list[idx]
 
 
+# ----------------------------------------------------------------------
+# Build dataset (slot → tokens) with optional domain ID
+# ----------------------------------------------------------------------
 def build_slot_dataset(model, corpus, tokenizer, device, domain_id=None):
     """
     For each sentence, find the closest slot and store (slot_vec, tokens, domain_id).
-    If domain_id is not None, it's added to each sample.
+    If domain_id is not None, it's added as a third element.
     """
     dataset = []
     for sent in corpus:
@@ -84,11 +99,14 @@ def build_slot_dataset(model, corpus, tokenizer, device, domain_id=None):
     return dataset
 
 
+# ----------------------------------------------------------------------
+# Dataloader builder with flexible collation
+# ----------------------------------------------------------------------
 def get_dataloaders(dataset, batch_size=16, val_split=0.2, include_domain=False):
     split = int((1 - val_split) * len(dataset))
     train_data = dataset[:split]
     val_data = dataset[split:]
-    
+
     def collate_fn(batch):
         if include_domain:
             slot_vecs = torch.stack([b[0] for b in batch])
@@ -101,12 +119,16 @@ def get_dataloaders(dataset, batch_size=16, val_split=0.2, include_domain=False)
             tokens_pad = torch.nn.utils.rnn.pad_sequence([b[1] for b in batch], batch_first=True, padding_value=0)
             return slot_vecs, tokens_pad
 
-    train_loader = DataLoader(SlotTextDataset(train_data), batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(SlotTextDataset(val_data), batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(SlotTextDataset(train_data), batch_size=batch_size,
+                              shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(SlotTextDataset(val_data), batch_size=batch_size,
+                            shuffle=False, collate_fn=collate_fn)
     return train_loader, val_loader
 
 
-# The philosophy corpus (60 abstract sentences)
+# ----------------------------------------------------------------------
+# Philosophy corpus (60 abstract sentences)
+# ----------------------------------------------------------------------
 PHILOSOPHY_CORPUS = [
     "The essence of existence precedes the nature of being.",
     "Causality is the necessary connection of phenomena.",

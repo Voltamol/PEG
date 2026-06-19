@@ -410,133 +410,28 @@ def run_experiment(corpus, corpus_name, ablate_energy=False, epochs=30):
     audit_slots(model, corpus, device, word_list, top_k=10)
     return model, word_list
 
-# ============================================================================
-# STRUCTURED TOPIC DISCOVERY TEST (AI / Sports / Finance / Politics)
-# ============================================================================
-
-def generate_mixed_headlines():
-    """4 distinct domains, 20 headlines each, shuffled."""
-    import random
-    random.seed(42)  # reproducible shuffle
-
-    ai_headlines = [
-        "OpenAI releases GPT-5 with reasoning capabilities",
-        "Google DeepMind develops new protein folding model",
-        "Anthropic's Claude surpasses human coding benchmarks",
-        "Nvidia announces new AI chip for data centers",
-        "Meta open-sources Llama 4 language model",
-        "AI startup raises $1 billion for autonomous agents",
-        "US government proposes AI safety regulations",
-        "China approves first generative AI model for public use",
-        "AI detects cancer with 95% accuracy in new study",
-        "Microsoft integrates Copilot into Windows kernel",
-        "Apple acquires AI music generation startup",
-        "EU passes landmark AI liability law",
-        "Robotics company deploys AI warehouse workers",
-        "OpenAI launches text-to-video generation tool",
-        "AI weather forecasting beats traditional models",
-        "Google introduces AI-powered search with citations",
-        "AMD unveils AI accelerator chip for laptops",
-        "AI generates full-length movie script in 24 hours",
-        "US military tests AI for drone navigation",
-        "AI language model passes medical licensing exam"
-    ]
-
-    sports_headlines = [
-        "Lionel Messi scores hat-trick in Inter Miami win",
-        "LeBron James signs extension with Lakers through 2027",
-        "Manchester City wins Premier League title on final day",
-        "Serena Williams announces retirement from tennis",
-        "Super Bowl LVIII draws record viewership",
-        "Real Madrid defeats Barcelona in El Clasico thriller",
-        "Tiger Woods withdraws from Masters due to injury",
-        "Olympic committee adds breakdancing to 2028 games",
-        "NBA finals go to Game 7 for first time in decade",
-        "Formula 1 driver wins dramatic rain-soaked Grand Prix",
-        "College football playoff expands to 16 teams",
-        "Wimbledon champion stunned in first-round upset",
-        "MLB proposes pitch clock changes for 2025 season",
-        "UFC heavyweight title fight ends in controversial decision",
-        "Women's World Cup final breaks attendance records",
-        "Boston Celtics acquire All-Star in blockbuster trade",
-        "Marathon world record shattered in Berlin",
-        "NHL postpones game due to severe weather",
-        "Tour de France champion disqualified for doping",
-        "Cricket World Cup final goes to super over"
-    ]
-
-    finance_headlines = [
-        "Fed signals rate cut as inflation cools to 2.8%",
-        "Goldman Sachs beats earnings estimates on trading surge",
-        "Tesla stock jumps 15% on record vehicle deliveries",
-        "Bitcoin crosses $70,000 amid institutional buying",
-        "JPMorgan reports strong quarterly profits, lowers loan loss reserves",
-        "S&P 500 hits all-time high on tech rally",
-        "Oil prices drop to 6-month low on demand fears",
-        "Apple faces $2 billion antitrust fine in EU",
-        "US treasury yields climb as jobs data beats forecasts",
-        "Visa acquires fintech startup for $5 billion",
-        "Alibaba shares soar on China economic stimulus news",
-        "Hedge fund returns surge after market volatility",
-        "SEC approves first spot bitcoin ETFs",
-        "Porsche IPO valuation falls short of expectations",
-        "Warren Buffett increases stake in Apple, sells Bank of America",
-        "China's economy grows 5.2% in Q4, below target",
-        "FedEx announces major restructuring, cuts 10,000 jobs",
-        "BlackRock launches new AI-focused fund",
-        "Eurozone inflation rises unexpectedly to 2.6%",
-        "UBS finalizes merger with Credit Suisse, cuts 3,000 roles"
-    ]
-
-    politics_headlines = [
-        "US Congress passes bipartisan infrastructure bill",
-        "Biden administration announces new climate executive order",
-        "UK Parliament votes to recognize Palestine as a state",
-        "French president calls for snap election after no-confidence vote",
-        "German coalition collapses in dispute over nuclear phase-out",
-        "China's military conducts largest-ever naval exercise",
-        "India's opposition wins state elections, boosts Modi pressure",
-        "Turkey blocks NATO expansion over Sweden membership dispute",
-        "Brazil launches criminal probe into former president",
-        "UN Security Council passes resolution on Gaza ceasefire",
-        "Russia offers sanctions relief in exchange for Ukraine neutrality",
-        "Japan's prime minister faces corruption allegations",
-        "Mexico elects first female president in landslide victory",
-        "Saudi Arabia announces major investment in renewable energy",
-        "South Africa appeals to Hague court on Israel genocide case",
-        "Australia commits to nuclear submarine fleet by 2040",
-        "Iran and US resume nuclear talks in Vienna",
-        "Canadian parliament approves carbon tax hike",
-        "Nigeria's president declares state of emergency on food security",
-        "Spain and Netherlands agree to boost European defense spending"
-    ]
-
-    all = ai_headlines + sports_headlines + finance_headlines + politics_headlines
-    random.shuffle(all)
-    return all
-
-# ============================================================================
-# RUN THE TEST
-# ============================================================================
 if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    config = PEGConfig()
-    
-    # Generate mixed headlines
-    headlines = generate_mixed_headlines()
-    print(f"Generated {len(headlines)} headlines.")
+    # ---------- Choose demo corpus ----------
+    RUN_PRONOM_TEST = True   # Set to False to run the original Eldoria story
 
-    # Train PEG with tuned hyperparameters (Energy ON)
-    model = PEGModel(config, device=str(device))
-    word_list = load_word_ontology(model, word_list_size=50000)
-    
-    print("Training PEG on mixed headlines...")
-    train_peg(model, headlines, epochs=30)
+    if RUN_PRONOM_TEST:
+        demo_corpus = pronoun_corpus
+        demo_name = "Pronoun Corpus"
+    else:
+        demo_corpus = original_corpus
+        demo_name = "Original Eldoria"
 
-    # Audit the slots
-    audit_slots(model, headlines, device, word_list, top_k=10)
+    print(f"\n--- DEMO: Training on {demo_name} ---")
+    model_demo, word_list_demo = run_experiment(demo_corpus, demo_name, ablate_energy=False, epochs=30)
 
-    # Optional: Check slot purity manually
-    # For each slot, look at the sample assigned sentences and note which domain they belong to.
-    # If Slot 0 has 19/20 AI headlines -> pure! 
-    # If Slot 0 has 8 AI, 6 Finance, 6 Politics -> mixed!
+    # ---------- Ablation experiments ----------
+    print("\n\n" + "="*80)
+    print("STARTING ABLATION EXPERIMENTS")
+    print("="*80)
+
+    run_experiment(original_corpus, "Original Eldoria", ablate_energy=False, epochs=30)
+    run_experiment(original_corpus, "Original Eldoria", ablate_energy=True, epochs=30)
+    run_experiment(pronoun_corpus, "Pronoun Corpus", ablate_energy=False, epochs=30)
+    run_experiment(pronoun_corpus, "Pronoun Corpus", ablate_energy=True, epochs=30)
+
+    print("\nAll experiments complete.")

@@ -14,7 +14,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import os
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from sentence_transformers import SentenceTransformer
@@ -171,23 +170,11 @@ class PEGModel(nn.Module):
             self.active_slots.remove(slot)
 
     # ---- forward ----
-    def forward(self, sentences: List[str] = None, next_sentences: List[str] = None,
-                z_t_raw: torch.Tensor = None, z_t_next_raw: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-        """
-        Either pass `sentences`/`next_sentences` (will be encoded on the fly, slow),
-        or pass precomputed raw encoder embeddings via `z_t_raw`/`z_t_next_raw`
-        (fast path — use this in training loops over a fixed corpus).
-        """
-        if z_t_raw is not None:
-            batch_size = z_t_raw.size(0)
-            with torch.no_grad():
-                z_t = self.proj_to_d(z_t_raw)
-                z_t_next = self.proj_to_d(z_t_next_raw)
-        else:
-            batch_size = len(sentences)
-            with torch.no_grad():
-                z_t = self.proj_to_d(torch.tensor(self.encoder.encode(sentences), device=self.device))
-                z_t_next = self.proj_to_d(torch.tensor(self.encoder.encode(next_sentences), device=self.device))
+    def forward(self, sentences: List[str], next_sentences: List[str]) -> Dict[str, torch.Tensor]:
+        batch_size = len(sentences)
+        with torch.no_grad():
+            z_t = self.proj_to_d(torch.tensor(self.encoder.encode(sentences), device=self.device))
+            z_t_next = self.proj_to_d(torch.tensor(self.encoder.encode(next_sentences), device=self.device))
 
         # context
         if self.active_slots:
@@ -332,27 +319,20 @@ class SlotTextDataset(Dataset):
         slot_vec, tokens = self.data[idx]
         return slot_vec, torch.tensor(tokens, dtype=torch.long)
 
-def build_slot_dataset(model, corpus, tokenizer, device, encode_batch_size=256):
+def build_slot_dataset(model, corpus, tokenizer, device):
     """For each sentence, find the closest slot and store (slot_vec, token_ids)."""
-    if not model.active_slots:
-        return []
-
-    # Batch-encode the whole corpus once instead of one sentence at a time.
-    with torch.no_grad():
-        raw_chunks = []
-        for i in range(0, len(corpus), encode_batch_size):
-            batch = corpus[i:i+encode_batch_size]
-            raw_chunks.append(model.encoder.encode(batch, convert_to_tensor=True, device=device))
-        raw_all = torch.cat(raw_chunks, dim=0)
-        z_all = model.proj_to_d(raw_all)  # (N, d)
-        slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)  # (n_slots, d)
-        sims = F.cosine_similarity(z_all.unsqueeze(1), slot_vecs.unsqueeze(0), dim=-1)  # (N, n_slots)
-        best_idx = sims.argmax(dim=-1)  # (N,)
-
     dataset = []
-    for sent, idx in zip(corpus, best_idx.tolist()):
+    for sent in corpus:
+        with torch.no_grad():
+            z = model.proj_to_d(torch.tensor(model.encoder.encode([sent]), device=device)).squeeze(0)
+            if not model.active_slots:
+                continue
+            slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)
+            sims = F.cosine_similarity(z.unsqueeze(0), slot_vecs, dim=1)
+            best_idx = sims.argmax().item()
+            slot_vec = model.active_slots[best_idx].vec
         tokens = tokenizer.encode(sent, add_special_tokens=True)
-        dataset.append((model.active_slots[idx].vec.cpu(), tokens))
+        dataset.append((slot_vec.cpu(), tokens))
     return dataset
 
 def get_dataloaders(dataset, batch_size=16, val_split=0.2):
@@ -370,92 +350,29 @@ def get_dataloaders(dataset, batch_size=16, val_split=0.2):
 # ----------------------------------------------------------------------
 # 6. TRAINING ROUTINES
 # ----------------------------------------------------------------------
-def train_peg(model, corpus, epochs=30, lr=1e-3, encode_batch_size=256,
-              checkpoint_dir='.', checkpoint_prefix='peg', resume=False):
+def train_peg(model, corpus, epochs=30, lr=1e-3):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    # ---- Precompute ALL sentence embeddings ONCE (the encoder is frozen, so its
-    # output for a given sentence never changes across steps/epochs). Re-encoding
-    # every step, as the original loop did, was the main reason training was slow:
-    # ~889 sentences * 2 calls * 30 epochs = ~53k redundant encoder forward passes.
-    print("Pre-encoding corpus with frozen SentenceTransformer (one-time cost)...")
-    raw_embeddings = []
+    # seed first slot
     with torch.no_grad():
-        for i in range(0, len(corpus), encode_batch_size):
-            batch = corpus[i:i+encode_batch_size]
-            emb = model.encoder.encode(batch, convert_to_tensor=True, device=model.device)
-            raw_embeddings.append(emb)
-    raw_embeddings = torch.cat(raw_embeddings, dim=0)  # (N, embed_dim), stays in raw encoder space
-    z_curr_all = raw_embeddings[:-1]
-    z_next_all = raw_embeddings[1:]
-    print(f"Pre-encoded {raw_embeddings.size(0)} sentences.")
-
-    # Determine starting epoch and load checkpoint if resuming
-    start_epoch = 0
-    if resume:
-        checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_latest.pt")
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=model.device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            print(f"Resuming from epoch {start_epoch}")
-            # Restore active slots from checkpoint
-            model.active_slots = checkpoint['active_slots']
-        else:
-            print("No checkpoint found, starting from scratch.")
-
-    # seed first slot only if starting from scratch
-    if start_epoch == 0:
-        with torch.no_grad():
-            z0 = model.proj_to_d(raw_embeddings[0].unsqueeze(0)).squeeze(0)
-            model.active_slots.append(model._spawn_slot(z0))
-
-    n_steps = len(corpus) - 1
-    for epoch in range(start_epoch, epochs):
+        z0 = model.proj_to_d(torch.tensor(model.encoder.encode([corpus[0]]), device=model.device)).squeeze(0)
+        model.active_slots.append(model._spawn_slot(z0))
+    for epoch in range(epochs):
         total_loss = 0.0
-        for i in range(n_steps):
-            loss_dict = model(z_t_raw=z_curr_all[i:i+1], z_t_next_raw=z_next_all[i:i+1])
+        for i in range(len(corpus)-1):
+            loss_dict = model([corpus[i]], [corpus[i+1]])
             loss = loss_dict['loss']
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
-        avg_loss = total_loss / n_steps
+        avg_loss = total_loss / (len(corpus)-1)
         print(f"PEG Epoch {epoch:02d} | loss={avg_loss:.4f} | slots={len(model.active_slots)}")
-
-        # ---- Save checkpoint every epoch ----
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'active_slots': model.active_slots,
-            'config': model.config,
-        }
-        torch.save(checkpoint, os.path.join(checkpoint_dir, f"{checkpoint_prefix}_latest.pt"))
-        # Also save epoch-specific backup
-        torch.save(checkpoint, os.path.join(checkpoint_dir, f"{checkpoint_prefix}_epoch_{epoch:02d}.pt"))
-
     print("PEG training complete.")
 
-def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3,
-                  checkpoint_dir='.', checkpoint_prefix='decoder', resume=False):
+def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3):
     optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
-
-    start_epoch = 0
-    if resume:
-        checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_latest.pt")
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=decoder.fc_out.weight.device)
-            decoder.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            print(f"Resuming decoder from epoch {start_epoch}")
-        else:
-            print("No decoder checkpoint found, starting from scratch.")
-
-    for epoch in range(start_epoch, epochs):
+    for epoch in range(epochs):
         decoder.train()
         total_loss = 0
         for slot_vecs, target_tokens in train_loader:
@@ -478,16 +395,6 @@ def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3,
                 val_loss += loss.item()
         avg_val = val_loss / len(val_loader)
         print(f"Decoder Epoch {epoch:02d} | train loss={avg_train:.4f} | val loss={avg_val:.4f}")
-
-        # ---- Save checkpoint every epoch ----
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': decoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }
-        torch.save(checkpoint, os.path.join(checkpoint_dir, f"{checkpoint_prefix}_latest.pt"))
-        torch.save(checkpoint, os.path.join(checkpoint_dir, f"{checkpoint_prefix}_epoch_{epoch:02d}.pt"))
-
     print("Decoder training complete.")
 
 # ----------------------------------------------------------------------
@@ -504,18 +411,8 @@ if __name__ == "__main__":
     # 2. Load a corpus (you can replace this with any list of sentences)
     longer_corpus = story_corpus
 
-    checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
     print(f"Training PEG on {len(longer_corpus)} sentences...")
-    train_peg(
-        model,
-        longer_corpus,
-        epochs=30,
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_prefix='peg',
-        resume=True,
-    )
+    train_peg(model, longer_corpus, epochs=30)
 
     # 3. Build slot-to-sentence dataset for decoder
     tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
@@ -535,15 +432,7 @@ if __name__ == "__main__":
         max_len=50
     ).to(device)
 
-    train_decoder(
-        decoder,
-        train_loader,
-        val_loader,
-        epochs=30,
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_prefix='decoder',
-        resume=True,
-    )
+    train_decoder(decoder, train_loader, val_loader, epochs=30)
 
     # 5. Test generation from a specific slot (e.g., 'raft')
     raft_slot = None

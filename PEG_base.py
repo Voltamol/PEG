@@ -39,6 +39,7 @@ class PEGConfig:
     theta_arch: float = 0.15       # higher = more aggressive pruning
     lambda_pred: float = 1.0         # predictive loss weight
     ontology_size: int = 50000       # number of words in ontology
+    ablate_energy: bool = False      # if True, disables decay, inhibition, merge, archive
 
 # ============================================================================
 # 3. PEG MODEL
@@ -132,6 +133,22 @@ class PEGModel(nn.Module):
         return z - z_explained, weights.tolist()
 
     def _update_energy(self, binding_weights):
+        if self.config.ablate_energy:
+            # ---- ABLATION: only boost, no decay, no inhibition, no merge, no archive ----
+            # Boost slots that were bound
+            for weights in binding_weights:
+                for slot, w in zip(self.active_slots, weights):
+                    if w > 0.1:
+                        slot.energy += self.config.alpha * (1 - slot.energy)
+                        slot.age += 1
+            # Clamp energies
+            for slot in self.active_slots:
+                slot.energy = max(0.0, min(1.0, slot.energy))
+            # No decay, no inhibition, no merge, no archive
+            return
+
+        # ---- ORIGINAL ENERGY SYSTEM (unchanged) ----
+        # Decay and boost
         for slot in self.active_slots:
             slot.energy *= self.config.gamma
         for weights in binding_weights:
@@ -436,3 +453,42 @@ if __name__ == "__main__":
     #     plt.title("Slot Evolution over the Story")
     #     plt.grid(alpha=0.3)
     #     plt.show()
+
+
+# ============================================================================
+# ENERGY ABLATION EXPERIMENT
+# ============================================================================
+def run_ablation(corpus, corpus_name, ablate):
+    print(f"\n{'='*60}")
+    print(f"Running ablation on: {corpus_name} | ablate_energy={ablate}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    config = PEGConfig()
+    config.ablate_energy = ablate   # set the flag
+    model = PEGModel(config, device=str(device))
+    word_list = load_word_ontology(model, word_list_size=50000)
+
+    train_peg(model, corpus, epochs=30)
+    audit_slots(model, corpus, device, word_list, top_k=10)
+    return model
+
+
+# Define the two corpora (use the original Eldoria and the pronoun version)
+original_corpus = story_corpus   # already defined
+pronoun_corpus = [
+    # (paste the pronoun corpus from the previous code, or use a variable if you defined it)
+]
+# If you haven't defined pronoun_corpus, you can reuse the list from earlier.
+
+
+# Run ablations
+print("\n--- ABLATION: Original Eldoria with energy system ON ---")
+model_orig_on = run_ablation(original_corpus, "Original Eldoria", ablate=False)
+
+print("\n--- ABLATION: Original Eldoria with energy system OFF ---")
+model_orig_off = run_ablation(original_corpus, "Original Eldoria", ablate=True)
+
+print("\n--- ABLATION: Pronoun Corpus with energy system ON ---")
+model_pron_on = run_ablation(pronoun_corpus, "Pronoun Corpus", ablate=False)
+
+print("\n--- ABLATION: Pronoun Corpus with energy system OFF ---")
+model_pron_off = run_ablation(pronoun_corpus, "Pronoun Corpus", ablate=True)

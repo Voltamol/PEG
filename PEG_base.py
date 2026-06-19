@@ -610,7 +610,7 @@ if __name__ == "__main__":
         num_layers=2,
         dim_feedforward=512,
         vocab_size=tokenizer.vocab_size,
-        max_len=50
+        max_len=256
     ).to(device)
 
     train_decoder(

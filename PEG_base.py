@@ -34,9 +34,9 @@ class PEGConfig:
     gamma: float = 0.995             # energy decay
     alpha: float = 0.1               # energy boost
     beta: float = 0.05               # lateral inhibition
-    theta_high: float = 0.25         # surprise threshold for spawning
-    theta_novel: float = 0.4         # novelty threshold (residual norm)
-    theta_arch: float = 0.10         # archival threshold
+        theta_high: float = 0.35       # higher = fewer spawns
+        theta_novel: float = 0.5       # higher = fewer spawns
+        theta_arch: float = 0.15       # higher = more aggressive pruning
     lambda_pred: float = 1.0         # predictive loss weight
     ontology_size: int = 50000       # number of words in ontology
 

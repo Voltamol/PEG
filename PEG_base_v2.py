@@ -25,57 +25,6 @@ import re
 import nltk
 from nltk.corpus import words as nltk_words
 from corpus_alice import corpus
-
-# ------------------------------
-# ENCODERS
-# ------------------------------
-class SentenceTransformerEncoder:
-    def __init__(self, model_name='all-MiniLM-L6-v2', device='cpu'):
-        self.model = SentenceTransformer(model_name, device=device)
-        self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
-        self.embed_dim = self.model.get_embedding_dimension()
-
-    def encode(self, sentences, convert_to_tensor=True, device=None):
-        return self.model.encode(sentences, convert_to_tensor=convert_to_tensor, device=device)
-
-    def get_embedding_dimension(self):
-        return self.embed_dim
-
-
-class GloVeEncoder:
-    def __init__(self, dim=100, device='cpu'):
-        import torchtext
-        self.device = device
-        self.glove = torchtext.vocab.GloVe(name='6B', dim=dim)
-        self.embed_dim = dim
-        self.dim = dim
-
-    def encode(self, sentences, convert_to_tensor=True, device=None):
-        # sentences: list of strings
-        device = device or self.device
-        embeddings = []
-        for sent in sentences:
-            # Split into words and remove punctuation (simple)
-            words = sent.lower().split()
-            vecs = []
-            for word in words:
-                if word in self.glove.stoi:
-                    vecs.append(self.glove[word])
-            if vecs:
-                avg_vec = torch.mean(torch.stack(vecs), dim=0)
-            else:
-                avg_vec = torch.zeros(self.dim)
-            embeddings.append(avg_vec)
-        out = torch.stack(embeddings)
-        if convert_to_tensor:
-            return out.to(device)
-        return out
-
-    def get_embedding_dimension(self):
-        return self.embed_dim
-
 #------------- ALICE IN WONDERLAND -------------------------------------
 story_corpus=corpus
 # ----------------------------------------------------------------------
@@ -125,18 +74,16 @@ class Slot:
         return isinstance(other, Slot) and id(self) == id(other)
 
 class PEGModel(nn.Module):
-    def __init__(self, config: PEGConfig, device='cpu', encoder_type='sentence_transformer'):
+    def __init__(self, config: PEGConfig, device='cpu'):
         super().__init__()
         self.config = config
         self.device = device
 
-        if encoder_type == 'sentence_transformer':
-            self.encoder = SentenceTransformerEncoder(device=device)
-        elif encoder_type == 'glove':
-            self.encoder = GloVeEncoder(dim=100, device=device)
-        else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}")
-
+        # Frozen encoder
+        self.encoder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+        self.encoder.eval()
+        for p in self.encoder.parameters():
+            p.requires_grad = False
         self.embed_dim = self.encoder.get_embedding_dimension()
         self.proj_to_d = nn.Linear(self.embed_dim, config.d) if self.embed_dim != config.d else nn.Identity()
 
@@ -368,24 +315,18 @@ class PEGModel(nn.Module):
 # ----------------------------------------------------------------------
 # 3. ONTOLOGY LOADING (REAL WORD EMBEDDINGS)
 # ----------------------------------------------------------------------
-def load_word_ontology(model: PEGModel, word_list_size=50000, batch_size=256, word_source='nltk'):
-    """Build ontology matrix from the selected encoder's vocabulary source."""
-    if word_source == 'nltk':
-        nltk.download('words', quiet=True)
-        words = nltk_words.words()
-        words = list(set([w.lower() for w in words if w.isalpha()]))[:word_list_size]
-    elif word_source == 'glove':
-        glove = model.encoder.glove
-        words = list(glove.stoi.keys())[:word_list_size]
-    else:
-        raise ValueError("word_source must be 'nltk' or 'glove'")
+def load_word_ontology(model: PEGModel, word_list_size=50000, batch_size=256):
+    """Build ontology matrix from nltk words using the model's encoder."""
+    nltk.download('words', quiet=True)
+    words = nltk_words.words()
+    words = list(set([w.lower() for w in words if w.isalpha()]))[:word_list_size]
     print(f"Loaded {len(words)} words for ontology.")
 
     # embed in batches
     embeddings = []
     for i in range(0, len(words), batch_size):
         batch = words[i:i+batch_size]
-        emb = model.encoder.encode(batch, convert_to_tensor=True, device=model.device)
+        emb = model.encoder.encode(batch, convert_to_tensor=True)
         embeddings.append(emb.cpu())
     emb_all = torch.cat(embeddings, dim=0)
     emb_all = F.normalize(emb_all, dim=-1)
@@ -633,12 +574,10 @@ def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3,
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = PEGConfig()
-    encoder_type = 'glove'
-    model = PEGModel(config, device=str(device), encoder_type=encoder_type)
+    model = PEGModel(config, device=str(device))
 
     # 1. Build real ontology
-    word_source = 'glove' if encoder_type == 'glove' else 'nltk'
-    word_list = load_word_ontology(model, word_list_size=50000, word_source=word_source)
+    word_list = load_word_ontology(model, word_list_size=50000)
 
     # 2. Load a corpus (you can replace this with any list of sentences)
     longer_corpus = story_corpus
@@ -650,7 +589,7 @@ if __name__ == "__main__":
     train_peg(
         model,
         longer_corpus,
-        epochs=10 if encoder_type == 'glove' else 30,
+        epochs=30,
         checkpoint_dir=checkpoint_dir,
         checkpoint_prefix='peg',
         resume=True,
@@ -681,7 +620,7 @@ if __name__ == "__main__":
         decoder,
         train_loader,
         val_loader,
-        epochs=10 if encoder_type == 'glove' else 30,
+        epochs=30,
         checkpoint_dir=checkpoint_dir,
         checkpoint_prefix='decoder',
         resume=True,

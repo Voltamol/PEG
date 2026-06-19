@@ -603,6 +603,9 @@ if __name__ == "__main__":
     train_loader, val_loader = get_dataloaders(slot_dataset, batch_size=16)
 
     # 4. Train transformer decoder
+    max_len = max(len(tokenizer.encode(sent, add_special_tokens=True)) for sent in longer_corpus) + 10
+    print(f"Auto-detected max sentence length: {max_len} tokens")
+
     decoder = TransformerSlotDecoder(
         slot_dim=config.d,
         d_model=256,
@@ -610,7 +613,7 @@ if __name__ == "__main__":
         num_layers=2,
         dim_feedforward=512,
         vocab_size=tokenizer.vocab_size,
-        max_len=256
+        max_len=max_len
     ).to(device)
 
     train_decoder(

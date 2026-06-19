@@ -473,7 +473,7 @@ def train_peg(model, corpus, epochs=30, lr=1e-3, encode_batch_size=256,
     if resume:
         checkpoint_path = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_latest.pt")
         if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=model.device)
+            checkpoint = torch.load(checkpoint_path, map_location=model.device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1

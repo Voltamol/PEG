@@ -25,58 +25,8 @@ import re
 import nltk
 from nltk.corpus import words as nltk_words
 from corpus_alice import corpus
-
-# ------------------------------
-# ENCODERS
-# ------------------------------
-class SentenceTransformerEncoder:
-    def __init__(self, model_name='all-MiniLM-L6-v2', device='cpu'):
-        self.model = SentenceTransformer(model_name, device=device)
-        self.model.eval()
-        self.embed_dim = self.model.get_embedding_dimension()
-
-    def encode(self, sentences, convert_to_tensor=True, device=None):
-        return self.model.encode(sentences, convert_to_tensor=convert_to_tensor, device=device)
-
-    def get_embedding_dimension(self):
-        return self.embed_dim
-
-
-class GloVeEncoder:
-    def __init__(self, dim=100, device='cpu'):
-        import gensim.downloader as api
-        self.device = device
-        self.dim = dim
-        # Download/cache the GloVe vectors (first time may take a minute)
-        print(f"Loading GloVe {dim}d vectors (cached after first download)...")
-        self.glove = api.load(f"glove-wiki-gigaword-{dim}")
-        self.embed_dim = dim
-
-    def encode(self, sentences, convert_to_tensor=True, device=None):
-        device = device or self.device
-        embeddings = []
-        for sent in sentences:
-            words = sent.lower().split()
-            vecs = []
-            for word in words:
-                if word in self.glove:
-                    vecs.append(torch.tensor(self.glove[word], device=device))
-            if vecs:
-                avg_vec = torch.mean(torch.stack(vecs), dim=0)
-            else:
-                avg_vec = torch.zeros(self.dim, device=device)
-            embeddings.append(avg_vec)
-        out = torch.stack(embeddings)
-        if convert_to_tensor:
-            return out.to(device)
-        return out
-
-    def get_embedding_dimension(self):
-        return self.embed_dim
-
 #------------- ALICE IN WONDERLAND -------------------------------------
-story_corpus=corpus
-longer_corpus = story_corpus
+#story_corpus=corpus
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------
@@ -124,22 +74,20 @@ class Slot:
         return isinstance(other, Slot) and id(self) == id(other)
 
 class PEGModel(nn.Module):
-    def __init__(self, config: PEGConfig, device='cpu', encoder_type='sentence_transformer'):
+    def __init__(self, config: PEGConfig, device='cpu'):
         super().__init__()
         self.config = config
         self.device = device
 
-        if encoder_type == 'sentence_transformer':
-            self.encoder = SentenceTransformerEncoder(device=device)
-        elif encoder_type == 'glove':
-            self.encoder = GloVeEncoder(dim=100, device=device)
-        else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}")
-
+        # Frozen encoder
+        self.encoder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+        self.encoder.eval()
+        for p in self.encoder.parameters():
+            p.requires_grad = False
         self.embed_dim = self.encoder.get_embedding_dimension()
         self.proj_to_d = nn.Linear(self.embed_dim, config.d) if self.embed_dim != config.d else nn.Identity()
 
-        # Frozen ontology (will be replaced with real embeddings)
+        # Frozen ontology
         self.register_buffer('ontology', F.normalize(torch.randn(config.ontology_size, config.d), dim=-1))
 
         # Trainable modules
@@ -367,27 +315,18 @@ class PEGModel(nn.Module):
 # ----------------------------------------------------------------------
 # 3. ONTOLOGY LOADING (REAL WORD EMBEDDINGS)
 # ----------------------------------------------------------------------
-def load_word_ontology(model: PEGModel, word_list_size=50000, batch_size=256, word_source='nltk'):
-    """Build ontology matrix from the selected encoder's vocabulary source."""
-    if word_source == 'nltk':
-        nltk.download('words', quiet=True)
-        words = nltk_words.words()
-        words = list(set([w.lower() for w in words if w.isalpha()]))[:word_list_size]
-        print(f"Loaded {len(words)} words from NLTK for ontology.")
-    elif word_source == 'glove':
-        # Use the GloVe vocabulary directly
-        glove = model.encoder.glove
-        words = list(glove.key_to_index.keys())
-        words = words[:word_list_size]
-        print(f"Using GloVe vocabulary: {len(words)} words.")
-    else:
-        raise ValueError("word_source must be 'nltk' or 'glove'")
+def load_word_ontology(model: PEGModel, word_list_size=50000, batch_size=256):
+    """Build ontology matrix from nltk words using the model's encoder."""
+    nltk.download('words', quiet=True)
+    words = nltk_words.words()
+    words = list(set([w.lower() for w in words if w.isalpha()]))[:word_list_size]
+    print(f"Loaded {len(words)} words for ontology.")
 
     # embed in batches
     embeddings = []
     for i in range(0, len(words), batch_size):
         batch = words[i:i+batch_size]
-        emb = model.encoder.encode(batch, convert_to_tensor=True, device=model.device)
+        emb = model.encoder.encode(batch, convert_to_tensor=True)
         embeddings.append(emb.cpu())
     emb_all = torch.cat(embeddings, dim=0)
     emb_all = F.normalize(emb_all, dim=-1)
@@ -635,86 +574,81 @@ def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3,
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = PEGConfig()
+    model = PEGModel(config, device=str(device))
 
-    # ---------- Choose encoder ----------
-    encoder_type = 'glove'   # or 'sentence_transformer'
+    # 1. Build real ontology
+    word_list = load_word_ontology(model, word_list_size=50000)
 
-    model = PEGModel(config, device=str(device), encoder_type=encoder_type)
-
-    # ---------- Build ontology ----------
-    word_source = 'glove' if encoder_type == 'glove' else 'nltk'
-    word_list = load_word_ontology(model, word_list_size=50000, word_source=word_source)
+    # 2. Load a corpus (you can replace this with any list of sentences)
+    longer_corpus = story_corpus
 
     checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # ---------- PEG training ----------
     print(f"Training PEG on {len(longer_corpus)} sentences...")
     train_peg(
         model,
         longer_corpus,
-        epochs=10 if encoder_type == 'glove' else 30,   # fewer epochs for GloVe
+        epochs=30,
         checkpoint_dir=checkpoint_dir,
         checkpoint_prefix='peg',
         resume=True,
     )
 
-    # ---------- Build slot dataset ----------
+    # 3. Build slot-to-sentence dataset for decoder
     tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
     tokenizer.pad_token = tokenizer.eos_token
 
     slot_dataset = build_slot_dataset(model, longer_corpus, tokenizer, device)
-    train_loader, val_loader = get_dataloaders(slot_dataset, batch_size=32 if encoder_type == 'glove' else 16)
+    train_loader, val_loader = get_dataloaders(slot_dataset, batch_size=16)
 
-    # ---------- Decoder training ----------
+    # 4. Train transformer decoder
     max_len = max(len(tokenizer.encode(sent, add_special_tokens=True)) for sent in longer_corpus) + 10
     print(f"Auto-detected max sentence length: {max_len} tokens")
 
-    if encoder_type == 'glove':
-        decoder = TransformerSlotDecoder(
-            slot_dim=config.d,
-            d_model=128,
-            nhead=2,
-            num_layers=1,
-            dim_feedforward=256,
-            vocab_size=tokenizer.vocab_size,
-            max_len=max_len
-        ).to(device)
-        epochs_dec = 10
-    else:
-        decoder = TransformerSlotDecoder(
-            slot_dim=config.d,
-            d_model=256,
-            nhead=4,
-            num_layers=2,
-            dim_feedforward=512,
-            vocab_size=tokenizer.vocab_size,
-            max_len=max_len
-        ).to(device)
-        epochs_dec = 30
-
-    # Optional: compile decoder for speed
-    if hasattr(torch, 'compile'):
-        print("Compiling decoder with torch.compile...")
-        decoder = torch.compile(decoder)
+    decoder = TransformerSlotDecoder(
+        slot_dim=config.d,
+        d_model=256,
+        nhead=4,
+        num_layers=2,
+        dim_feedforward=512,
+        vocab_size=tokenizer.vocab_size,
+        max_len=max_len
+    ).to(device)
 
     train_decoder(
         decoder,
         train_loader,
         val_loader,
-        epochs=epochs_dec,
+        epochs=30,
         checkpoint_dir=checkpoint_dir,
         checkpoint_prefix='decoder',
         resume=True,
     )
 
-    # ---------- Generation tests ----------
-    # (same as before, but remove the 'raft' search for Alice)
-    # We'll just test the arbitrary sentence slot.
+    # 5. Test generation from a specific slot (e.g., 'raft')
+    raft_slot = None
+    with torch.no_grad():
+        for slot in model.active_slots:
+            slot_norm = F.normalize(slot.vec.unsqueeze(0), dim=-1)
+            sims = slot_norm @ F.normalize(model.ontology, dim=-1).T
+            if word_list[sims.argmax().item()] == 'raft':
+                raft_slot = slot
+                break
+
+    if raft_slot:
+        decoder.eval()
+        with torch.no_grad():
+            tokens = decoder(raft_slot.vec.unsqueeze(0).to(device), target_tokens=None, max_len=30)
+            print("Generated from 'raft' slot:")
+            print(tokenizer.decode(tokens[0].cpu().numpy(), skip_special_tokens=True))
+    else:
+        print("No slot labelled 'raft' found.")
+
+    # Also test on an arbitrary sentence's slot
     test_sent = "Leo spotted a broken rope bridge on the other side."
     with torch.no_grad():
-        # Fix the UserWarning: use .detach().clone() instead of torch.tensor()
-        z = model.proj_to_d(model.encoder.encode([test_sent], convert_to_tensor=True, device=device)).squeeze(0)
+        z = model.proj_to_d(torch.tensor(model.encoder.encode([test_sent]), device=device)).squeeze(0)
         slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)
         sims = F.cosine_similarity(z.unsqueeze(0), slot_vecs, dim=1)
         best_vec = model.active_slots[sims.argmax().item()].vec

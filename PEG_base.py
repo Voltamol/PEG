@@ -25,6 +25,7 @@ import re
 import nltk
 from nltk.corpus import words as nltk_words
 from corpus_alice import corpus
+from story_corpus import story_corpus
 #------------- ALICE IN WONDERLAND -------------------------------------
 #story_corpus=corpus
 # ----------------------------------------------------------------------

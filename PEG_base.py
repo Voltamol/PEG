@@ -129,11 +129,17 @@ class PEGModel(nn.Module):
         super().__init__()
         self.config = config
         self.device = device
+        self.encoder_type = encoder_type
 
         if encoder_type == 'sentence_transformer':
             self.encoder = SentenceTransformerEncoder(device=device)
         elif encoder_type == 'glove':
-            self.encoder = GloVeEncoder(dim=100, device=device)
+            try:
+                self.encoder = GloVeEncoder(dim=100, device=device)
+            except ModuleNotFoundError:
+                print("torchtext is not installed; falling back to SentenceTransformer encoder.")
+                self.encoder = SentenceTransformerEncoder(device=device)
+                self.encoder_type = 'sentence_transformer'
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
@@ -637,7 +643,7 @@ if __name__ == "__main__":
     model = PEGModel(config, device=str(device), encoder_type=encoder_type)
 
     # 1. Build real ontology
-    word_source = 'glove' if encoder_type == 'glove' else 'nltk'
+    word_source = 'glove' if getattr(model, 'encoder_type', encoder_type) == 'glove' else 'nltk'
     word_list = load_word_ontology(model, word_list_size=50000, word_source=word_source)
 
     # 2. Load a corpus (you can replace this with any list of sentences)

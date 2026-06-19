@@ -76,6 +76,7 @@ class GloVeEncoder:
 
 #------------- ALICE IN WONDERLAND -------------------------------------
 story_corpus=corpus
+longer_corpus = story_corpus
 # ----------------------------------------------------------------------
 # 1. CONFIGURATION
 # ----------------------------------------------------------------------
@@ -643,6 +644,9 @@ if __name__ == "__main__":
     # ---------- Build ontology ----------
     word_source = 'glove' if encoder_type == 'glove' else 'nltk'
     word_list = load_word_ontology(model, word_list_size=50000, word_source=word_source)
+
+    checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     # ---------- PEG training ----------
     print(f"Training PEG on {len(longer_corpus)} sentences...")

@@ -634,83 +634,83 @@ def train_decoder(decoder, train_loader, val_loader, epochs=30, lr=1e-3,
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = PEGConfig()
-    encoder_type = 'glove'
+
+    # ---------- Choose encoder ----------
+    encoder_type = 'glove'   # or 'sentence_transformer'
+
     model = PEGModel(config, device=str(device), encoder_type=encoder_type)
 
-    # 1. Build real ontology
+    # ---------- Build ontology ----------
     word_source = 'glove' if encoder_type == 'glove' else 'nltk'
     word_list = load_word_ontology(model, word_list_size=50000, word_source=word_source)
 
-    # 2. Load a corpus (you can replace this with any list of sentences)
-    longer_corpus = story_corpus
-
-    checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-
+    # ---------- PEG training ----------
     print(f"Training PEG on {len(longer_corpus)} sentences...")
     train_peg(
         model,
         longer_corpus,
-        epochs=10 if encoder_type == 'glove' else 30,
+        epochs=10 if encoder_type == 'glove' else 30,   # fewer epochs for GloVe
         checkpoint_dir=checkpoint_dir,
         checkpoint_prefix='peg',
         resume=True,
     )
 
-    # 3. Build slot-to-sentence dataset for decoder
+    # ---------- Build slot dataset ----------
     tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
     tokenizer.pad_token = tokenizer.eos_token
 
     slot_dataset = build_slot_dataset(model, longer_corpus, tokenizer, device)
-    train_loader, val_loader = get_dataloaders(slot_dataset, batch_size=16)
+    train_loader, val_loader = get_dataloaders(slot_dataset, batch_size=32 if encoder_type == 'glove' else 16)
 
-    # 4. Train transformer decoder
+    # ---------- Decoder training ----------
     max_len = max(len(tokenizer.encode(sent, add_special_tokens=True)) for sent in longer_corpus) + 10
     print(f"Auto-detected max sentence length: {max_len} tokens")
 
-    decoder = TransformerSlotDecoder(
-        slot_dim=config.d,
-        d_model=256,
-        nhead=4,
-        num_layers=2,
-        dim_feedforward=512,
-        vocab_size=tokenizer.vocab_size,
-        max_len=max_len
-    ).to(device)
+    if encoder_type == 'glove':
+        decoder = TransformerSlotDecoder(
+            slot_dim=config.d,
+            d_model=128,
+            nhead=2,
+            num_layers=1,
+            dim_feedforward=256,
+            vocab_size=tokenizer.vocab_size,
+            max_len=max_len
+        ).to(device)
+        epochs_dec = 10
+    else:
+        decoder = TransformerSlotDecoder(
+            slot_dim=config.d,
+            d_model=256,
+            nhead=4,
+            num_layers=2,
+            dim_feedforward=512,
+            vocab_size=tokenizer.vocab_size,
+            max_len=max_len
+        ).to(device)
+        epochs_dec = 30
+
+    # Optional: compile decoder for speed
+    if hasattr(torch, 'compile'):
+        print("Compiling decoder with torch.compile...")
+        decoder = torch.compile(decoder)
 
     train_decoder(
         decoder,
         train_loader,
         val_loader,
-        epochs=10 if encoder_type == 'glove' else 30,
+        epochs=epochs_dec,
         checkpoint_dir=checkpoint_dir,
         checkpoint_prefix='decoder',
         resume=True,
     )
 
-    # 5. Test generation from a specific slot (e.g., 'raft')
-    raft_slot = None
-    with torch.no_grad():
-        for slot in model.active_slots:
-            slot_norm = F.normalize(slot.vec.unsqueeze(0), dim=-1)
-            sims = slot_norm @ F.normalize(model.ontology, dim=-1).T
-            if word_list[sims.argmax().item()] == 'raft':
-                raft_slot = slot
-                break
-
-    if raft_slot:
-        decoder.eval()
-        with torch.no_grad():
-            tokens = decoder(raft_slot.vec.unsqueeze(0).to(device), target_tokens=None, max_len=30)
-            print("Generated from 'raft' slot:")
-            print(tokenizer.decode(tokens[0].cpu().numpy(), skip_special_tokens=True))
-    else:
-        print("No slot labelled 'raft' found.")
-
-    # Also test on an arbitrary sentence's slot
+    # ---------- Generation tests ----------
+    # (same as before, but remove the 'raft' search for Alice)
+    # We'll just test the arbitrary sentence slot.
     test_sent = "Leo spotted a broken rope bridge on the other side."
     with torch.no_grad():
-        z = model.proj_to_d(torch.tensor(model.encoder.encode([test_sent]), device=device)).squeeze(0)
+        # Fix the UserWarning: use .detach().clone() instead of torch.tensor()
+        z = model.proj_to_d(model.encoder.encode([test_sent], convert_to_tensor=True, device=device)).squeeze(0)
         slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)
         sims = F.cosine_similarity(z.unsqueeze(0), slot_vecs, dim=1)
         best_vec = model.active_slots[sims.argmax().item()].vec

@@ -328,111 +328,17 @@ def audit_slots(model, corpus, device, word_list, top_k=10):
 # ============================================================================
 # 7. DEMO
 # ============================================================================
-# ============================================================================
-# 7. DEMO
-# ============================================================================
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = PEGConfig()
     model = PEGModel(config, device=str(device))
 
     word_list = load_word_ontology(model, word_list_size=50000)
+    longer_corpus = story_corpus
 
-    # ---------- Choose which corpus to run ----------
-    RUN_PRONOM_TEST = True   # Set to False to run the original Eldoria story
+    print(f"Training PEG on {len(longer_corpus)} sentences...")
+    train_peg(model, longer_corpus, epochs=30)
 
-    if RUN_PRONOM_TEST:
-        # Pronoun-replaced corpus (names → roles)
-        corpus = [
-            "The boy was a young adventurer from the village of Eldoria.",
-            "The girl was his best friend and the smartest person he knew.",
-            "The friend was their clumsy but loyal companion.",
-            "One day, the boy found an old map in his grandfather's attic.",
-            "The map showed the way to the Lost Treasure of Eldoria.",
-            "The boy showed the map to the girl and the friend.",
-            "The girl studied the map carefully.",
-            "She noticed a hidden path through the Whispering Forest.",
-            "The friend accidentally tore the map while examining it.",
-            "Everyone laughed, but they were still excited.",
-            "They packed their bags with food and water.",
-            "They set out at sunrise the next morning.",
-            "The Whispering Forest was dark and eerie.",
-            "Strange sounds echoed through the trees.",
-            "The girl used her knowledge of stars to guide them.",
-            "The boy hacked through the thick bushes with a knife.",
-            "The friend tripped over a root and fell into a muddy puddle.",
-            "They finally reached the center of the forest.",
-            "In the center stood an ancient stone door.",
-            "The door was covered in strange symbols.",
-            "The girl realized the symbols were a riddle.",
-            "The boy solved the riddle by saying the password aloud.",
-            "The stone door creaked open.",
-            "Behind the door was a dark cave.",
-            "The cave was cold and damp.",
-            "They lit a torch to see inside.",
-            "The torchlight revealed a narrow tunnel.",
-            "They walked through the tunnel for hours.",
-            "The friend kept complaining about his wet shoes.",
-            "The girl told him to be quiet and listen for danger.",
-            "They heard the sound of running water.",
-            "They emerged from the tunnel into a massive underground cavern.",
-            "Inside the cavern was a raging underground river.",
-            "There was no bridge to cross the river.",
-            "The boy spotted a broken rope bridge on the other side.",
-            "They needed to get across to reach the treasure.",
-            "The girl suggested they build a raft from fallen wood.",
-            "They worked together to build a sturdy raft.",
-            "The raft barely held together as they crossed.",
-            "The friend nearly fell into the river twice.",
-            "They made it safely to the other side.",
-            "There, they found a golden chest.",
-            "The chest was locked with a heavy iron lock.",
-            "The girl tried to pick the lock with a hairpin.",
-            "She managed to open the lock after several attempts.",
-            "Inside the chest, there was no gold.",
-            "Instead, there was a single, glowing crystal.",
-            "The crystal pulsed with a warm, magical light.",
-            "The girl knew immediately that the crystal was priceless.",
-            "The boy placed the crystal carefully in his backpack.",
-            "They decided to head back to Eldoria.",
-            "On their way back, they used the raft to cross the river again.",
-            "They passed through the tunnel and the stone door.",
-            "The Whispering Forest seemed less scary on the way back.",
-            "They arrived in Eldoria as heroes.",
-            "The village elder congratulated them on their success.",
-            "The boy, the girl, and the friend were proud of their adventure.",
-            "They placed the glowing crystal in the village square.",
-            "The crystal brought good luck and prosperity to Eldoria.",
-            "The boy, the girl, and the friend remained best friends forever."
-        ]
-        print(f"Running PRONOUN REPLACEMENT TEST: {len(corpus)} sentences.")
-    else:
-        # Original Eldoria story (already imported from story_corpus)
-        corpus = story_corpus
-        print(f"Running ORIGINAL ELDORIA STORY: {len(corpus)} sentences.")
-
-    print(f"Training PEG on {len(corpus)} sentences...")
-    train_peg(model, corpus, epochs=30)
-
-    audit_slots(model, corpus, device, word_list, top_k=10)
-
-    # Optional: Slot evolution timeline
-    # If you want to plot, uncomment the following lines:
-    # import matplotlib.pyplot as plt
-    # with torch.no_grad():
-    #     raw_emb = []
-    #     for i in range(0, len(corpus), 256):
-    #         batch = corpus[i:i+256]
-    #         raw_emb.append(model.encoder.encode(batch, convert_to_tensor=True, device=device))
-    #     raw_emb = torch.cat(raw_emb, dim=0)
-    #     z_all = model.proj_to_d(raw_emb)
-    #     slot_vecs = torch.stack([s.vec for s in model.active_slots]).to(device)
-    #     sims = F.cosine_similarity(z_all.unsqueeze(1), slot_vecs.unsqueeze(0), dim=-1)
-    #     assigned = sims.argmax(dim=-1)
-    #     plt.figure(figsize=(12, 4))
-    #     plt.plot(assigned.cpu().numpy(), marker='o', linestyle='-', markersize=4)
-    #     plt.xlabel("Sentence Index")
-    #     plt.ylabel("Slot Index")
-    #     plt.title("Slot Evolution over the Story")
-    #     plt.grid(alpha=0.3)
-    #     plt.show()
+    audit_slots(model, longer_corpus, device, word_list, top_k=10)
+    # ----------- Visualisation -----------------------
+    

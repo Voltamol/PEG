@@ -33,8 +33,6 @@ class SentenceTransformerEncoder:
     def __init__(self, model_name='all-MiniLM-L6-v2', device='cpu'):
         self.model = SentenceTransformer(model_name, device=device)
         self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
         self.embed_dim = self.model.get_embedding_dimension()
 
     def encode(self, sentences, convert_to_tensor=True, device=None):
@@ -46,27 +44,27 @@ class SentenceTransformerEncoder:
 
 class GloVeEncoder:
     def __init__(self, dim=100, device='cpu'):
-        import torchtext
+        import gensim.downloader as api
         self.device = device
-        self.glove = torchtext.vocab.GloVe(name='6B', dim=dim)
-        self.embed_dim = dim
         self.dim = dim
+        # Download/cache the GloVe vectors (first time may take a minute)
+        print(f"Loading GloVe {dim}d vectors (cached after first download)...")
+        self.glove = api.load(f"glove-wiki-gigaword-{dim}")
+        self.embed_dim = dim
 
     def encode(self, sentences, convert_to_tensor=True, device=None):
-        # sentences: list of strings
         device = device or self.device
         embeddings = []
         for sent in sentences:
-            # Split into words and remove punctuation (simple)
             words = sent.lower().split()
             vecs = []
             for word in words:
-                if word in self.glove.stoi:
-                    vecs.append(self.glove[word])
+                if word in self.glove:
+                    vecs.append(torch.tensor(self.glove[word], device=device))
             if vecs:
                 avg_vec = torch.mean(torch.stack(vecs), dim=0)
             else:
-                avg_vec = torch.zeros(self.dim)
+                avg_vec = torch.zeros(self.dim, device=device)
             embeddings.append(avg_vec)
         out = torch.stack(embeddings)
         if convert_to_tensor:
@@ -129,24 +127,18 @@ class PEGModel(nn.Module):
         super().__init__()
         self.config = config
         self.device = device
-        self.encoder_type = encoder_type
 
         if encoder_type == 'sentence_transformer':
             self.encoder = SentenceTransformerEncoder(device=device)
         elif encoder_type == 'glove':
-            try:
-                self.encoder = GloVeEncoder(dim=100, device=device)
-            except ModuleNotFoundError:
-                print("torchtext is not installed; falling back to SentenceTransformer encoder.")
-                self.encoder = SentenceTransformerEncoder(device=device)
-                self.encoder_type = 'sentence_transformer'
+            self.encoder = GloVeEncoder(dim=100, device=device)
         else:
             raise ValueError(f"Unknown encoder_type: {encoder_type}")
 
         self.embed_dim = self.encoder.get_embedding_dimension()
         self.proj_to_d = nn.Linear(self.embed_dim, config.d) if self.embed_dim != config.d else nn.Identity()
 
-        # Frozen ontology
+        # Frozen ontology (will be replaced with real embeddings)
         self.register_buffer('ontology', F.normalize(torch.randn(config.ontology_size, config.d), dim=-1))
 
         # Trainable modules
@@ -380,12 +372,15 @@ def load_word_ontology(model: PEGModel, word_list_size=50000, batch_size=256, wo
         nltk.download('words', quiet=True)
         words = nltk_words.words()
         words = list(set([w.lower() for w in words if w.isalpha()]))[:word_list_size]
+        print(f"Loaded {len(words)} words from NLTK for ontology.")
     elif word_source == 'glove':
+        # Use the GloVe vocabulary directly
         glove = model.encoder.glove
-        words = list(glove.stoi.keys())[:word_list_size]
+        words = list(glove.key_to_index.keys())
+        words = words[:word_list_size]
+        print(f"Using GloVe vocabulary: {len(words)} words.")
     else:
         raise ValueError("word_source must be 'nltk' or 'glove'")
-    print(f"Loaded {len(words)} words for ontology.")
 
     # embed in batches
     embeddings = []
@@ -643,7 +638,7 @@ if __name__ == "__main__":
     model = PEGModel(config, device=str(device), encoder_type=encoder_type)
 
     # 1. Build real ontology
-    word_source = 'glove' if getattr(model, 'encoder_type', encoder_type) == 'glove' else 'nltk'
+    word_source = 'glove' if encoder_type == 'glove' else 'nltk'
     word_list = load_word_ontology(model, word_list_size=50000, word_source=word_source)
 
     # 2. Load a corpus (you can replace this with any list of sentences)

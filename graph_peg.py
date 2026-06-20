@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg_v12.1_fast.py — Fast, GPU-ready, large-corpus Graph-PEG (device fix)
-# VERSION MARKER: v12.1-fast-gpu-device-fix
+# graph_peg_v13.py — Verb as weak cue, larger predictor, mixed negatives
+# VERSION MARKER: v13-verb-cue-mixed-negatives
 
 import torch
 import torch.nn as nn
@@ -21,11 +21,12 @@ class GraphPEGConfig:
         self.lr = 1e-4
         self.weight_decay = 1e-5
         self.epochs = 100
-        self.num_negatives = 10
+        self.num_negatives = 10          # half hard, half random
         self.dropout = 0.1
-        self.temperature = 0.1
+        self.temperature = 0.2           # softer
         self.noise_std = 0.05
-        self.batch_size = 32           # gradient accumulation size
+        self.batch_size = 32
+        self.verb_weight = 0.2           # weak verb cue
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -58,9 +59,13 @@ class GraphPEGModel(nn.Module):
         )
         self.role_proj = nn.Linear(config.role_dim, config.hidden_dim)
 
-        # predictor: simple MLP (two layers)
+        # predictor: deeper (3 layers)
         self.predictor = nn.Sequential(
             nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
             nn.ReLU(),
             nn.Dropout(config.dropout),
@@ -73,19 +78,14 @@ class GraphPEGModel(nn.Module):
         self.embed_dim = sample_emb.shape[0]
         self.entity_proj = nn.Linear(self.embed_dim, config.hidden_dim)
 
-        # dynamic state (will be moved to device later)
-        self.entity_energies = torch.ones(len(self.dataset['entities'])) * 0.5
-        self.event_occurrence_counts = torch.zeros(self.num_event_types, dtype=torch.long)
-
-        # --- MOVE MODEL TO DEVICE BEFORE PRECOMPUTING ---
+        # move to device first
         self.to(config.device)
 
-        # Pre‑compute projected entity embeddings and keep them as buffer
+        # precompute entity embeddings
         self._precompute_entity_embeddings()
 
-        # role‑entity map for hard negatives (no tensors, safe)
+        # role‑entity map for hard negatives
         self._build_role_entity_map()
-
 
     def _precompute_entity_embeddings(self):
         entities = self.dataset['entities']
@@ -99,12 +99,10 @@ class GraphPEGModel(nn.Module):
             else:
                 emb = entities[eid]['mentions'][0]['embedding']
             emb_list.append(emb)
-        raw_embs = torch.stack(emb_list)  # (num_entities, embed_dim)
-        # project all at once; everything is already on the correct device
+        raw_embs = torch.stack(emb_list)
         with torch.no_grad():
             proj_embs = self.entity_proj(raw_embs.to(self.config.device))
         self.register_buffer('entity_embeddings', proj_embs)
-        # also create mapping id -> row
         sorted_ids = sorted(entities.keys())
         self._entity_id_to_row = {eid: i for i, eid in enumerate(sorted_ids)}
         self.all_entity_ids = list(entities.keys())
@@ -134,11 +132,13 @@ class GraphPEGModel(nn.Module):
 
     def _get_entity_embedding(self, entity_id: int) -> torch.Tensor:
         row = self._entity_id_to_row[entity_id]
-        return self.entity_embeddings[row]   # already projected
+        return self.entity_embeddings[row]
 
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
-        # No verb embedding, just sum of role*entity for all other roles
-        vec = torch.zeros(self.config.hidden_dim, device=self.config.device)
+        # Verb embedding (weak cue)
+        verb_emb = self._get_event_type_embedding(event_data['event_type'])
+        # Sum of role*entity for all other roles
+        role_sum = torch.zeros(self.config.hidden_dim, device=self.config.device)
         for i, role_info in enumerate(event_data['roles']):
             if i == exclude_role_slot:
                 continue
@@ -148,8 +148,9 @@ class GraphPEGModel(nn.Module):
             entity_id = role_info['entity_id']
             role_emb = self.role_proj(self._get_role_embedding(role))
             entity_emb = self._get_entity_embedding(entity_id)
-            vec = vec + role_emb * entity_emb
-        return vec
+            role_sum = role_sum + role_emb * entity_emb
+        # Combine: weak verb + strong role sum
+        return self.config.verb_weight * verb_emb + (1 - self.config.verb_weight) * role_sum
 
     def _predict_filler(self, context_vec: torch.Tensor, role: str) -> torch.Tensor:
         role_emb = self._get_role_embedding(role)
@@ -168,40 +169,49 @@ class GraphPEGModel(nn.Module):
             noise = torch.randn_like(context) * self.config.noise_std
             context = context + noise
 
-        pred = self._predict_filler(context, role_name)   # (hidden_dim,)
+        pred = self._predict_filler(context, role_name)
         pos_emb = self._get_entity_embedding(target_entity_id)
 
-        # Hard negatives: same verb-role
+        # Mix of hard and random negatives (half each)
         hard_pool = self.role_entity_map.get((verb, role_name), [])
         hard_neg_ids = [eid for eid in hard_pool if eid != target_entity_id]
-        if len(hard_neg_ids) > self.config.num_negatives:
-            hard_neg_ids = random.sample(hard_neg_ids, self.config.num_negatives)
-        elif len(hard_neg_ids) > 0:
-            # pad with random negatives
-            random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
-            if random_pool:
-                extra = random.sample(random_pool, min(self.config.num_negatives - len(hard_neg_ids), len(random_pool)))
-                hard_neg_ids.extend(extra)
+        random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
+
+        num_hard = self.config.num_negatives // 2
+        num_random = self.config.num_negatives - num_hard
+
+        if len(hard_neg_ids) > num_hard:
+            sampled_hard = random.sample(hard_neg_ids, num_hard)
         else:
-            random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id]
-            hard_neg_ids = random.sample(random_pool, min(self.config.num_negatives, len(random_pool)))
+            sampled_hard = hard_neg_ids
+            num_random = self.config.num_negatives - len(sampled_hard)
 
-        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in hard_neg_ids])  # (K, hidden_dim)
+        if len(random_pool) > num_random:
+            sampled_random = random.sample(random_pool, num_random)
+        else:
+            sampled_random = random_pool
 
-        # Normalize
+        neg_ids = sampled_hard + sampled_random
+        if len(neg_ids) < 1:
+            # fallback: all random
+            neg_ids = random.sample([eid for eid in self.all_entity_ids if eid != target_entity_id],
+                                    min(self.config.num_negatives, len(self.all_entity_ids)-1))
+
+        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])
+
         pred_norm = F.normalize(pred, dim=0)
         pos_norm = F.normalize(pos_emb, dim=0)
         neg_norm = F.normalize(neg_embs, dim=1)
 
         pos_sim = torch.dot(pred_norm, pos_norm)
-        neg_sim = torch.mv(neg_norm, pred_norm)   # (K,)
+        neg_sim = torch.mv(neg_norm, pred_norm)
 
         logits = torch.cat([pos_sim.unsqueeze(0), neg_sim]) / self.config.temperature
         labels = torch.zeros(1, dtype=torch.long, device=pred.device)
         loss = F.cross_entropy(logits.unsqueeze(0), labels)
         return loss
 
-    # ---- Surprise (for evaluation) ----
+    # ---- Surprise ----
     def compute_role_surprise(self, event_id: int, role_slot_idx: int) -> float:
         event_data = self.dataset['events'][event_id]
         role_info = event_data['roles'][role_slot_idx]
@@ -223,7 +233,7 @@ class GraphPEGModel(nn.Module):
 
 
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP WITH GRADIENT ACCUMULATION
+# 3. TRAINING LOOP (same as v12)
 # --------------------------------------------------------------------
 def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
     optimizer = torch.optim.Adam(model.parameters(),
@@ -254,10 +264,10 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
             slots = maskable_slots[eid]
             role_slot_idx = random.choice(slots)
             loss = model.compute_loss(eid, role_slot_idx)
-            loss = loss / batch_size   # normalize for accumulation
+            loss = loss / batch_size
             loss.backward()
 
-            # update occurrence counts (not used in fast mode, but keep)
+            # update counts (not used)
             event_type = events[eid]['event_type']
             idx = model.event_type_to_idx[event_type]
             model.event_occurrence_counts[idx] += 1
@@ -266,7 +276,7 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                total_loss += loss.item() * batch_size   # unscale for logging
+                total_loss += loss.item() * batch_size
                 n_steps += 1
 
         avg_loss = total_loss / max(n_steps, 1)
@@ -345,13 +355,16 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
             surprises = {}
             for i, r in enumerate(roles):
-                context_vec = torch.zeros(model.config.hidden_dim, device=model.config.device)
+                # Build context with verb cue
+                verb_vec = event_vec.clone() if event_type in model.event_type_to_idx else torch.zeros_like(event_vec)
+                role_sum = torch.zeros(model.config.hidden_dim, device=model.config.device)
                 for j, other in enumerate(roles):
                     if i == j:
                         continue
                     role_emb = model.role_proj(model._get_role_embedding(other['role']))
                     entity_emb = entity_projs[other['entity_text']]
-                    context_vec = context_vec + role_emb * entity_emb
+                    role_sum = role_sum + role_emb * entity_emb
+                context_vec = model.config.verb_weight * verb_vec + (1 - model.config.verb_weight) * role_sum
 
                 pred = model._predict_filler(context_vec, r['role'])
                 target = entity_projs[r['entity_text']]
@@ -424,10 +437,10 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v12.1-fast-gpu-device-fix <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v13-verb-cue-mixed-negatives <<<")
 
     if len(sys.argv) < 2:
-        print("Usage: python3 graph_peg_v12.1_fast.py <graph_corpus.pkl> [epochs]")
+        print("Usage: python3 graph_peg_v13.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
     epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 100

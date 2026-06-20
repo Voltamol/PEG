@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg_v12_fast.py — Fast, GPU-ready, large-corpus Graph-PEG
-# VERSION MARKER: v12-fast-gpu
+# graph_peg_v12.1_fast.py — Fast, GPU-ready, large-corpus Graph-PEG (device fix)
+# VERSION MARKER: v12.1-fast-gpu-device-fix
 
 import torch
 import torch.nn as nn
@@ -67,24 +67,25 @@ class GraphPEGModel(nn.Module):
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
 
-        # entity projection (trainable, but we pre‑compute once)
+        # entity projection
         sample_ent = next(iter(self.dataset['entities'].values()))
         sample_emb = sample_ent['mentions'][0]['embedding']
         self.embed_dim = sample_emb.shape[0]
         self.entity_proj = nn.Linear(self.embed_dim, config.hidden_dim)
 
-        # Pre‑compute projected entity embeddings and keep them as buffer
-        self._precompute_entity_embeddings()
-
-        # dynamic state (not used in fast training, but kept for compatibility)
+        # dynamic state (will be moved to device later)
         self.entity_energies = torch.ones(len(self.dataset['entities'])) * 0.5
         self.event_occurrence_counts = torch.zeros(self.num_event_types, dtype=torch.long)
 
-        # role‑entity map for hard negatives
+        # --- MOVE MODEL TO DEVICE BEFORE PRECOMPUTING ---
+        self.to(config.device)
+
+        # Pre‑compute projected entity embeddings and keep them as buffer
+        self._precompute_entity_embeddings()
+
+        # role‑entity map for hard negatives (no tensors, safe)
         self._build_role_entity_map()
 
-        # move to device
-        self.to(config.device)
 
     def _precompute_entity_embeddings(self):
         entities = self.dataset['entities']
@@ -99,7 +100,7 @@ class GraphPEGModel(nn.Module):
                 emb = entities[eid]['mentions'][0]['embedding']
             emb_list.append(emb)
         raw_embs = torch.stack(emb_list)  # (num_entities, embed_dim)
-        # project all at once
+        # project all at once; everything is already on the correct device
         with torch.no_grad():
             proj_embs = self.entity_proj(raw_embs.to(self.config.device))
         self.register_buffer('entity_embeddings', proj_embs)
@@ -423,10 +424,10 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v12-fast-gpu <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v12.1-fast-gpu-device-fix <<<")
 
     if len(sys.argv) < 2:
-        print("Usage: python3 graph_peg_v12_fast.py <graph_corpus.pkl> [epochs]")
+        print("Usage: python3 graph_peg_v12.1_fast.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
     epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 100

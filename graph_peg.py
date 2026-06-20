@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# graph_peg.py — Graph‑PEG engine v7 (simpler, robust, with InfoNCE + MSE auxiliary)
-# VERSION MARKER: v7-simple-robust
+# graph_peg.py — Graph‑PEG engine v7.1 (fixed buffer, robust training)
+# VERSION MARKER: v7.1-buffer-fixed
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pickle
 import random
+import numpy as np
 from typing import List, Dict, Optional, Any
 from torch.optim.lr_scheduler import StepLR
 
@@ -30,7 +31,7 @@ class GraphPEGConfig:
         self.mask_prob = 0.15
         self.num_negatives = 15
         self.dropout = 0.1
-        self.temperature = 0.1          # initial, will be learned if we make it a parameter
+        self.temperature = 0.1          # initial, will be learned
         self.mse_weight = 0.1           # auxiliary MSE weight
 
 
@@ -78,6 +79,9 @@ class GraphPEGModel(nn.Module):
         self.embed_dim = sample_emb.shape[0]
         self.entity_proj = nn.Linear(self.embed_dim, config.hidden_dim)
 
+        # ---- FIX: register entity embeddings buffer ----
+        self.register_buffer('entity_embeddings', self._build_entity_embeddings())
+
         # learnable temperature for InfoNCE
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / config.temperature))
 
@@ -96,8 +100,18 @@ class GraphPEGModel(nn.Module):
         self.to('cpu')
 
     def _build_entity_embeddings(self):
-        # not used; we keep entity embeddings as buffers from dataset
-        pass
+        entities = self.dataset['entities']
+        emb_list = []
+        for eid in sorted(entities.keys()):
+            policy = entities[eid]['embedding_policy']
+            if policy == 'most_recent':
+                emb = entities[eid]['mentions'][-1]['embedding']
+            elif policy == 'mean':
+                emb = torch.mean(torch.stack([m['embedding'] for m in entities[eid]['mentions']]), dim=0)
+            else:
+                emb = entities[eid]['mentions'][0]['embedding']
+            emb_list.append(emb)
+        return torch.stack(emb_list)  # (num_entities, embed_dim)
 
     def _build_role_entity_map(self):
         self.role_entity_map = {}
@@ -124,7 +138,7 @@ class GraphPEGModel(nn.Module):
 
     def _get_entity_embedding(self, entity_id: int) -> torch.Tensor:
         row = self._entity_id_to_row[entity_id]
-        raw_emb = self.entity_embeddings[row]   # buffer from dataset
+        raw_emb = self.entity_embeddings[row]   # now buffer exists
         return self.entity_proj(raw_emb)
 
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
@@ -342,12 +356,11 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (fixed)
+# 5. NOVELTY TEST (fixed extraction)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     import spacy
     from sentence_transformers import SentenceTransformer
-    import numpy as np
 
     print("\n" + "="*60)
     print("NOVELTY TEST (Option C in action)")
@@ -457,8 +470,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    import numpy as np   # added for logit scale init
-    print(">>> RUNNING graph_peg.py VERSION: v7-simple-robust <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v7.1-buffer-fixed <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")

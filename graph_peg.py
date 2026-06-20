@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg.py — The Graph‑PEG engine.
-# VERSION MARKER: v4.1-fix-inference-tensor
+# graph_peg.py — Graph‑PEG engine v5 (hard negatives, triplet loss, fixed test)
+# VERSION MARKER: v5-hard-negatives-fixed-test
 
 import torch
 import torch.nn as nn
@@ -14,10 +14,10 @@ from typing import List, Dict, Optional, Any
 # --------------------------------------------------------------------
 class GraphPEGConfig:
     def __init__(self):
-        self.hidden_dim = 384          # Increased for better capacity
+        self.hidden_dim = 512
         self.role_dim = 64
-        self.lr = 1e-3
-        self.epochs = 30
+        self.lr = 5e-4
+        self.epochs = 60
         self.gamma = 0.995
         self.alpha = 0.1
         self.beta = 0.05
@@ -26,9 +26,10 @@ class GraphPEGConfig:
         self.min_occurrences = 3
         self.merge_threshold = 0.95
         self.mask_prob = 0.15
-        self.temperature = 0.1          # NEW: for contrastive loss
-        self.num_negatives = 5          # NEW: number of negative samples per mask
-
+        self.temperature = 0.1
+        self.num_negatives = 10          # more negatives
+        self.dropout = 0.1
+        self.margin = 0.2               # for triplet loss
 
 # --------------------------------------------------------------------
 # 2. GRAPH PEG MODEL
@@ -39,7 +40,6 @@ class GraphPEGModel(nn.Module):
         self.config = config
         self.dataset = dataset
 
-        # Fixed role vocabulary (must match preprocessor)
         self.role_to_idx = {
             'AGENT': 0, 'PATIENT': 1, 'RECIPIENT': 2, 'LOCATION': 3,
             'TIME': 4, 'MANNER': 5, 'MODIFIER': 6, 'POLARITY': 7, 'MOOD': 8
@@ -47,7 +47,6 @@ class GraphPEGModel(nn.Module):
         self.idx_to_role = {v: k for k, v in self.role_to_idx.items()}
         self.num_roles = len(self.role_to_idx)
 
-        # Event types (verbs/predicates)
         self.event_type_to_idx = dict(dataset['event_types'])
         self.num_event_types = len(self.event_type_to_idx)
 
@@ -60,17 +59,28 @@ class GraphPEGModel(nn.Module):
         )
         self.role_proj = nn.Linear(config.role_dim, config.hidden_dim)
 
-        # ---- Predictor: event context + role -> predicted entity embedding ----
+        # ---- Context composer (now concatenation + MLP) ----
+        # We'll build context by concatenating all (role_proj(role_emb) * entity_emb) except masked.
+        # To allow interaction, we'll project each role-entity product and sum, then pass through MLP.
+        # Actually simpler: sum of products, but we add a non-linear projection after sum.
+        self.context_mlp = nn.Sequential(
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim)
+        )
+
+        # ---- Predictor: context + role -> predicted entity embedding ----
         self.predictor = nn.Sequential(
             nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim),
             nn.ReLU(),
+            nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim, config.hidden_dim),
         )
 
-        # ---- Entity embeddings (frozen, from preprocessor) ----
+        # ---- Entity embeddings (frozen) ----
         self.register_buffer('entity_embeddings', self._build_entity_embeddings())
 
-        # ---- Entity projection (trainable) to align MiniLM dims to hidden_dim ----
         sample_ent = next(iter(self.dataset['entities'].values()))
         sample_emb = sample_ent['mentions'][0]['embedding']
         self.embed_dim = sample_emb.shape[0]
@@ -84,8 +94,10 @@ class GraphPEGModel(nn.Module):
 
         sorted_ids = sorted(self.dataset['entities'].keys())
         self._entity_id_to_row = {eid: i for i, eid in enumerate(sorted_ids)}
-        # NEW: list of all entity IDs for negative sampling
         self.all_entity_ids = list(self.dataset['entities'].keys())
+
+        # ---- Pre‑compute which entities appear in which role for each verb (for hard negatives) ----
+        self._build_role_entity_map()
 
         self.to('cpu')
 
@@ -101,7 +113,24 @@ class GraphPEGModel(nn.Module):
             else:
                 emb = entities[eid]['mentions'][0]['embedding']
             emb_list.append(emb)
-        return torch.stack(emb_list)  # (num_entities, embed_dim)
+        return torch.stack(emb_list)
+
+    def _build_role_entity_map(self):
+        # Map (event_type, role_name) -> list of entity_ids that fill that role
+        self.role_entity_map = {}
+        for event in self.dataset['events']:
+            verb = event['event_type']
+            for role_info in event['roles']:
+                if role_info['entity_id'] is None:
+                    continue
+                role = role_info['role']
+                key = (verb, role)
+                if key not in self.role_entity_map:
+                    self.role_entity_map[key] = []
+                self.role_entity_map[key].append(role_info['entity_id'])
+        # Remove duplicates
+        for k in self.role_entity_map:
+            self.role_entity_map[k] = list(set(self.role_entity_map[k]))
 
     def _get_event_type_embedding(self, event_type: str) -> torch.Tensor:
         idx = self.event_type_to_idx[event_type]
@@ -117,7 +146,8 @@ class GraphPEGModel(nn.Module):
         return self.entity_proj(raw_emb)
 
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
-        vec = self._get_event_type_embedding(event_data['event_type']).clone()
+        # Sum of (role_proj(role_emb) * entity_emb) for all roles except excluded
+        vec = torch.zeros(self.config.hidden_dim, device=self.event_embeddings.device)
         for i, role_info in enumerate(event_data['roles']):
             if i == exclude_role_slot:
                 continue
@@ -128,50 +158,50 @@ class GraphPEGModel(nn.Module):
             role_emb = self.role_proj(self._get_role_embedding(role))
             entity_emb = self._get_entity_embedding(entity_id)
             vec = vec + role_emb * entity_emb
-        return vec
+        # Apply MLP to get final context
+        return self.context_mlp(vec)
 
     def _predict_filler(self, context_vec: torch.Tensor, role: str) -> torch.Tensor:
         role_emb = self._get_role_embedding(role)
         combined = torch.cat([context_vec, role_emb], dim=-1)
         return self.predictor(combined)
 
-    # NEW: Contrastive loss for a single masked slot
-    def compute_contrastive_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
+    # ---- Triplet loss with hard negatives ----
+    def compute_triplet_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
         event_data = self.dataset['events'][event_id]
         masked_role = event_data['roles'][role_slot_idx]
         role_name = masked_role['role']
         target_entity_id = masked_role['entity_id']
+        verb = event_data['event_type']
 
         context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
-        pred_emb = self._predict_filler(context, role_name)   # (hidden_dim,)
+        anchor = self._predict_filler(context, role_name)   # predicted embedding (anchor)
 
-        pos_emb = self._get_entity_embedding(target_entity_id)  # (hidden_dim,)
+        pos_emb = self._get_entity_embedding(target_entity_id)  # positive
 
-        # Sample negative entities (distinct from positive)
-        neg_candidates = [eid for eid in self.all_entity_ids if eid != target_entity_id]
-        neg_ids = random.sample(neg_candidates, min(self.config.num_negatives, len(neg_candidates)))
-        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])  # (K, hidden_dim)
+        # Hard negatives: other entities that fill the same role for the same verb
+        hard_neg_ids = [eid for eid in self.role_entity_map.get((verb, role_name), []) if eid != target_entity_id]
+        if len(hard_neg_ids) > self.config.num_negatives:
+            hard_neg_ids = random.sample(hard_neg_ids, self.config.num_negatives)
+        # If not enough hard negatives, pad with random negatives
+        if len(hard_neg_ids) < self.config.num_negatives:
+            pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
+            if pool:
+                extra = random.sample(pool, min(self.config.num_negatives - len(hard_neg_ids), len(pool)))
+                hard_neg_ids.extend(extra)
 
-        # Compute cosine similarities
-        sim_pos = F.cosine_similarity(pred_emb.unsqueeze(0), pos_emb.unsqueeze(0))  # (1,)
-        sim_neg = F.cosine_similarity(pred_emb.unsqueeze(0), neg_embs)             # (K,)
+        if not hard_neg_ids:
+            # fallback: random negatives
+            neg_candidates = [eid for eid in self.all_entity_ids if eid != target_entity_id]
+            hard_neg_ids = random.sample(neg_candidates, min(self.config.num_negatives, len(neg_candidates)))
 
-        logits = torch.cat([sim_pos, sim_neg]) / self.config.temperature  # (K+1,)
-        labels = torch.zeros(1, dtype=torch.long, device=pred_emb.device)  # positive index = 0
-        loss = F.cross_entropy(logits.unsqueeze(0), labels)
+        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in hard_neg_ids])
+
+        # Triplet loss: max(0, margin + d(anchor, pos) - d(anchor, neg))
+        pos_dist = 1 - F.cosine_similarity(anchor.unsqueeze(0), pos_emb.unsqueeze(0))
+        neg_dists = 1 - F.cosine_similarity(anchor.unsqueeze(0), neg_embs)   # (K,)
+        loss = torch.mean(F.relu(self.config.margin + pos_dist - neg_dists))
         return loss
-
-    # Old MSE loss kept for reference (not used in training)
-    def compute_mse_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
-        event_data = self.dataset['events'][event_id]
-        masked_role_info = event_data['roles'][role_slot_idx]
-        role_name = masked_role_info['role']
-        target_entity_id = masked_role_info['entity_id']
-
-        context_vec = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
-        pred_emb = self._predict_filler(context_vec, role_name)
-        target_emb = self._get_entity_embedding(target_entity_id)
-        return F.mse_loss(pred_emb, target_emb)
 
     def compute_role_surprise(self, event_id: int, role_slot_idx: int) -> float:
         event_data = self.dataset['events'][event_id]
@@ -195,7 +225,7 @@ class GraphPEGModel(nn.Module):
     def compose_full_event(self, event_data: Dict) -> torch.Tensor:
         return self._compose_context(event_data, exclude_role_slot=None)
 
-    # ---- Energy System (unchanged) ----
+    # ---- Energy System ----
     def update_energy(self, event_ids: List[int]):
         self.entity_energies *= self.config.gamma
         touched = set()
@@ -210,14 +240,12 @@ class GraphPEGModel(nn.Module):
         event_data = self.dataset['events'][event_id]
         return [r['entity_id'] for r in event_data['roles'] if r['entity_id'] is not None]
 
-    # ---- Spawning ----
     def should_spawn(self, event_type: str) -> bool:
         if event_type not in self.event_type_to_idx:
             return True
         idx = self.event_type_to_idx[event_type]
         return self.event_occurrence_counts[idx] < self.config.min_occurrences
 
-    # ---- Archival ----
     def archive(self):
         to_archive = torch.where(self.entity_energies < self.config.theta_arch)[0].tolist()
         row_to_id = {v: k for k, v in self._entity_id_to_row.items()}
@@ -227,9 +255,9 @@ class GraphPEGModel(nn.Module):
 
 
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP (UPDATED with contrastive loss)
+# 3. TRAINING LOOP
 # --------------------------------------------------------------------
-def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
+def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=60):
     optimizer = torch.optim.Adam(model.parameters(), lr=model.config.lr)
     events = dataset['events']
 
@@ -244,8 +272,6 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
         print("No events have a maskable role — nothing to train on.")
         return
 
-    skipped_single_role_note_shown = False
-
     for epoch in range(epochs):
         random.shuffle(trainable_event_ids)
         total_loss = 0.0
@@ -255,11 +281,7 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
             slots = maskable_slots[eid]
             role_slot_idx = random.choice(slots)
 
-            if len(slots) == 1 and not skipped_single_role_note_shown:
-                skipped_single_role_note_shown = True
-
-            # NEW: Use contrastive loss instead of MSE
-            loss = model.compute_contrastive_loss(eid, role_slot_idx)
+            loss = model.compute_triplet_loss(eid, role_slot_idx)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -267,7 +289,6 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
             total_loss += loss.item()
             n_steps += 1
 
-            # Update occurrence counts (for spawning logic)
             event_type = events[eid]['event_type']
             idx = model.event_type_to_idx[event_type]
             model.event_occurrence_counts[idx] += 1
@@ -318,15 +339,9 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (fixed appos extraction + inference tensor fix)
+# 5. NOVELTY TEST (fixed extraction for Test 3)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
-    """
-    Tests three novelty scenarios:
-    1. Known verb + new modifier
-    2. New verb + known filler
-    3. New verb + completely new entities
-    """
     import spacy
     from sentence_transformers import SentenceTransformer
 
@@ -338,7 +353,6 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     encoder = SentenceTransformer('all-MiniLM-L6-v2')
 
     def compute_surprise_for_new_event(event_type: str, roles: List[Dict]):
-        # Wrap everything in no_grad to avoid inference tensor issues and to save compute
         with torch.no_grad():
             if event_type in model.event_type_to_idx:
                 event_vec = model._get_event_type_embedding(event_type)
@@ -352,13 +366,13 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
             for r in roles:
                 text = r['entity_text']
                 raw_emb = encoder.encode([text], convert_to_tensor=True).squeeze(0)
-                # FIX: clone to remove inference mode
                 raw_emb = raw_emb.clone()
                 proj_emb = model.entity_proj(raw_emb.to(model.event_embeddings.device))
                 entity_projs[text] = proj_emb
 
             surprises = {}
             for i, r in enumerate(roles):
+                # Build context manually (without the masked role)
                 context_vec = event_vec.clone()
                 for j, other in enumerate(roles):
                     if i == j:
@@ -366,6 +380,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
                     role_emb = model.role_proj(model._get_role_embedding(other['role']))
                     entity_emb = entity_projs[other['entity_text']]
                     context_vec = context_vec + role_emb * entity_emb
+                context_vec = model.context_mlp(context_vec)   # apply same MLP
 
                 pred_emb = model._predict_filler(context_vec, r['role'])
                 target_emb = entity_projs[r['entity_text']]
@@ -407,41 +422,15 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for role, val in surprises2.items():
         print(f"    {role}: surprise={val:.4f}")
 
-    # --- Test 3: NEW verb + NEW entities (FIXED appos extraction) ---
+    # --- Test 3: NEW verb + NEW entities (FIXED: manual roles) ---
     print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
     new_sentence3 = "Zorp the alien arrived."
-    doc3 = nlp(new_sentence3)
-    root3 = [t for t in doc3 if t.dep_ == 'ROOT'][0]
-    event_type3 = root3.lemma_
-    roles3 = []
-
-    # Find the nsubj child of the root
-    subj = None
-    for child in root3.children:
-        if child.dep_ == 'nsubj':
-            subj = child
-            break
-
-    if subj:
-        # AGENT is the head noun (the subj itself)
-        roles3.append({'role': 'AGENT', 'entity_text': subj.text})
-        # Look for appos modifiers attached to this subj
-        for child in subj.children:
-            if child.dep_ == 'appos':
-                roles3.append({'role': 'MODIFIER', 'entity_text': child.text})
-                break
-        else:  # fallback: scan entire doc for appos whose head is the subj
-            for token in doc3:
-                if token.dep_ == 'appos' and token.head == subj:
-                    roles3.append({'role': 'MODIFIER', 'entity_text': token.text})
-                    break
-    else:
-        # Fallback: if no subject found, try to find any appos as modifier (unlikely)
-        for token in doc3:
-            if token.dep_ == 'appos':
-                roles3.append({'role': 'MODIFIER', 'entity_text': token.text})
-                break
-
+    event_type3 = "arrive"
+    # Manually set roles to avoid parsing ambiguity
+    roles3 = [
+        {'role': 'AGENT', 'entity_text': 'Zorp'},
+        {'role': 'MODIFIER', 'entity_text': 'alien'}
+    ]
     print(f"  Sentence: {new_sentence3!r}")
     print(f"  Extracted roles: {[(r['role'], r['entity_text']) for r in roles3]}")
     surprises3, status3 = compute_surprise_for_new_event(event_type3, roles3)
@@ -465,13 +454,13 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v4.1-fix-inference-tensor <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v5-hard-negatives-fixed-test <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
-    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 
     with open(sys.argv[1], 'rb') as f:
         dataset = pickle.load(f)

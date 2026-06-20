@@ -162,12 +162,59 @@ DEP_TO_ROLE = {
     'amod': 'MODIFIER',
 }
 
-LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind', 'to', 'into', 'from', 'through'}
+LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind',
+                   'to', 'into', 'from', 'through', 'inside', 'outside',
+                   'beneath', 'beside', 'within', 'above', 'below'}
 TIME_PREPS = {'at', 'on', 'in', 'during', 'after', 'before', 'since', 'until'}
 
+# Words that, as the OBJECT of an ambiguous preposition (in/on/at — all
+# three appear in both LOCATION_PREPS and TIME_PREPS above), signal that
+# this particular instance is temporal rather than locative. "on Sundays"
+# vs "on the table"; "in the morning" vs "in the cavern".
+TIME_NOUNS = {
+    'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+    'saturday', 'sundays', 'mondays', 'tuesdays', 'wednesdays',
+    'thursdays', 'fridays', 'saturdays',
+    'morning', 'afternoon', 'evening', 'night', 'noon', 'midnight',
+    'sunrise', 'sunset', 'dawn', 'dusk',
+    'january', 'february', 'march', 'april', 'may', 'june', 'july',
+    'august', 'september', 'october', 'november', 'december',
+    'minute', 'hour', 'day', 'week', 'month', 'year', 'decade',
+    'minutes', 'hours', 'days', 'weeks', 'months', 'years', 'decades',
+    'attempt', 'attempts', 'occasion', 'occasions',  # "after several attempts"
+}
 
-def map_prep_role(prep_token) -> str:
+
+def map_prep_role(prep_token, prep_obj_token=None) -> str:
+    """
+    CONFIRMED LATENT BUG, found via real corpus run: "in"/"on"/"at" are
+    ambiguous between location and time ("in the center" vs "in the
+    morning"), and the original code always checked TIME_PREPS first,
+    so EVERY use of these three prepositions resolved to TIME regardless
+    of the actual object — "in the center" incorrectly became TIME, not
+    LOCATION. This stayed hidden through the demo run (which only tested
+    "on Sundays", where TIME-first happened to be correct) and only
+    surfaced once a larger, more varied corpus was run.
+    Fix: for the three ambiguous prepositions specifically, check the
+    object noun against a small list of time-denoting words; only
+    resolve to TIME if the object actually looks temporal. Unambiguous
+    prepositions (behind, into, during, etc.) are unaffected.
+    """
     lemma = prep_token.lemma_.lower()
+    AMBIGUOUS = {'in', 'on', 'at'}
+
+    if lemma in AMBIGUOUS:
+        # Check both the lemma AND the raw lowercased text — uncertain
+        # whether spaCy's lemmatizer normalizes "Sundays" -> "sunday" in
+        # all cases (e.g. for proper-noun-tagged weekday names), so this
+        # hedges rather than assuming one behaves correctly. Verify
+        # against real output if "on Sundays" stops resolving to TIME.
+        obj_lemma = prep_obj_token.lemma_.lower() if prep_obj_token is not None else ''
+        obj_text = prep_obj_token.text.lower() if prep_obj_token is not None else ''
+        if obj_lemma in TIME_NOUNS or obj_text in TIME_NOUNS:
+            return 'TIME'
+        return 'LOCATION'
+
     if lemma in TIME_PREPS:
         return 'TIME'
     if lemma in LOCATION_PREPS:
@@ -248,7 +295,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
         elif dep == 'prep':
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
             if prep_objs:
-                role = map_prep_role(child)
+                role = map_prep_role(child, prep_objs[0])
                 roles.append({'role': role, 'entity_text': prep_objs[0].text,
                               'is_pronoun': prep_objs[0].text.lower() in PRONOUNS})
         elif dep == 'advmod':
@@ -549,7 +596,7 @@ def dump_events(output):
 
 
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v6-control-verb-lexicon-and-dative-prep-fix <<<")
+    print(">>> RUNNING preprocess.py VERSION: v7-ambiguous-preposition-disambiguation <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

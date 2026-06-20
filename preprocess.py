@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # preprocess.py — Generate the Graph-PEG dataset from raw text.
 #
+# VERSION MARKER: v4-location-prep-fix
+# (If the printed output when you run this doesn't show "v4-location-prep-fix"
+#  at the top, you are running a stale/different copy of this file — check
+#  for duplicate files in your working directory.)
+#
 # IMPORTANT — READ BEFORE TRUSTING THIS FILE:
 # I do not have a working spaCy install in my execution sandbox (no network
 # route to spaCy's model release assets from here), so the dependency-label
@@ -149,7 +154,7 @@ DEP_TO_ROLE = {
     'amod': 'MODIFIER',
 }
 
-LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind'}
+LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind', 'to', 'into', 'from', 'through'}
 TIME_PREPS = {'at', 'on', 'in', 'during', 'after', 'before', 'since', 'until'}
 
 
@@ -439,6 +444,7 @@ def dump_events(output):
 
 
 if __name__ == "__main__":
+    print(">>> RUNNING preprocess.py VERSION: v4-location-prep-fix <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

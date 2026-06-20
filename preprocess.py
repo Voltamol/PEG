@@ -140,14 +140,22 @@ PRONOUNS = {
 # --------------------------------------------------------------------
 DEP_TO_ROLE = {
     'nsubj': 'AGENT',
-    'nsubjpass': 'AGENT',
+    'nsubjpass': 'PATIENT',  # CONFIRMED BUG FIX: "The door was covered" —
+                             # "door" is nsubjpass, and it is the thing
+                             # acted upon, not the actor. The previous
+                             # mapping (AGENT) made every passive sentence
+                             # semantically backwards. A passive sentence's
+                             # real agent, if stated at all, shows up as
+                             # `prep(by) -> pobj`, handled separately below.
     'dobj': 'PATIENT',
     'iobj': 'RECIPIENT',
     'dative': 'RECIPIENT',   # "gave him a book": spaCy often tags "him" as
                              # `dative`, not `iobj`, depending on model
-                             # version. Both map to RECIPIENT. VERIFY THIS
-                             # against your installed spaCy's actual output
-                             # on a ditransitive sentence before trusting it.
+                             # version. Both map to RECIPIENT. Verified
+                             # against real output: this corpus's "showed
+                             # the map to Mia and Sam" used `dative` on the
+                             # preposition itself ("to"), not the noun —
+                             # see the prep-handling branch for that case.
     'pobj': None,            # handled specially — see map_prep_role()
     'advmod': 'MANNER',
     'neg': 'POLARITY',
@@ -182,13 +190,25 @@ def map_prep_role(prep_token) -> str:
 def find_predicate_tokens(doc):
     """
     Returns every token that should head its own event: main verbs,
-    copula-like predicates (ROOT with attr/acomp children even if the
-    ROOT itself is a form of "be"), and verbs embedded in relative
-    clauses or clausal complements.
+    copula-like predicates, and verbs embedded in relative clauses,
+    clausal complements, or adverbial clauses.
+
+    Excludes:
+      - dep_ == 'aux' / 'auxpass': these are auxiliary verbs attached to
+        a real predicate elsewhere in the tree (e.g. "was" in "was
+        covered" — the real predicate is "covered", which IS picked up
+        separately since it's the ROOT here).
+      - dep_ == 'amod': a verb form used adjectivally ("running water",
+        "raging river", "glowing crystal"). These describe a noun, they
+        don't assert a separate event with its own roles. CONFIRMED via
+        real corpus run: these were previously caught as predicates,
+        produced a [WARN] "zero roles" line, and added noise events with
+        no content. Excluding them removes the noise at the source
+        instead of warning about it after the fact.
     """
     predicates = []
     for tok in doc:
-        if tok.pos_ in ('VERB', 'AUX') and tok.dep_ != 'aux':
+        if tok.pos_ in ('VERB', 'AUX') and tok.dep_ not in ('aux', 'auxpass', 'amod'):
             predicates.append(tok)
     return predicates
 
@@ -228,6 +248,59 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
         elif dep == 'neg':
             roles.append({'role': 'POLARITY', 'entity_text': 'negative',
                           'is_pronoun': False})
+
+    # Control-verb subject inheritance — NEW FIX, generalizes the relcl
+    # fix below to xcomp/ccomp/advcl predicates.
+    #
+    # CONFIRMED BUG from real corpus run: "Sam kept complaining about his
+    # wet shoes" produced a 'complain' event with ZERO roles, because
+    # "complaining" (dep=xcomp) has no nsubj child of its own — its
+    # subject is "Sam", inherited from the matrix verb "kept". Same
+    # pattern broke "get" (sentence 35), "raging"/"glowing" (now filtered
+    # out separately as amod), "be quiet"/"listen" in sentence 29, and
+    # several others.
+    #
+    # Rule (standard control-verb distinction):
+    #   - SUBJECT CONTROL (xcomp, ccomp, advcl with no dobj on the matrix
+    #     verb): embedded subject = matrix verb's subject.
+    #     "Sam kept [complaining]" -> complaining's AGENT = Sam.
+    #   - OBJECT CONTROL (matrix verb has a dobj AND the embedded clause
+    #     is xcomp): embedded subject = matrix verb's object, not subject.
+    #     "Mia told him [to be quiet]" -> be's AGENT = him, not Mia.
+    #
+    # This is a heuristic, not a full control-verb lexicon (true object-
+    # vs-subject control depends on the specific matrix verb: "told"/
+    # "asked"/"ordered" are object control, "tried"/"decided"/"managed"/
+    # "needed" are subject control). The heuristic below — object control
+    # iff the matrix verb has its own dobj — gets this right for every
+    # verb in this corpus's run, but is NOT guaranteed for all English
+    # control verbs. Flag for review if you hit a counterexample.
+    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl', 'conj') and \
+            not any(r['role'] == 'AGENT' for r in roles):
+        matrix = pred_token.head
+        matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
+        matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+
+        # For `conj` specifically: a verb conjoined with another verb
+        # ("be quiet and listen") inherits the SAME subject as the verb
+        # it's conjoined with, not the object — coordination doesn't
+        # change who's doing the action. Only treat matrix as having a
+        # "dobj-style" controller when the relation is xcomp/ccomp/advcl
+        # (true control), not conj (coordination).
+        if pred_token.dep_ == 'conj':
+            inherited = matrix_subj
+            # If the head we conjoined with itself had no overt subject
+            # (e.g. it inherited one via this same mechanism, like "be"
+            # inheriting "him" from "told"), matrix_subj will be None
+            # here since we only check direct .children, not inherited
+            # roles. Known limitation: chained coordination beyond one
+            # level may need a second pass. Flag if this comes up.
+        else:
+            inherited = matrix_dobj if matrix_dobj is not None else matrix_subj
+
+        if inherited is not None:
+            roles.append({'role': 'AGENT', 'entity_text': inherited.text,
+                          'is_pronoun': inherited.text.lower() in PRONOUNS})
 
     # Relative clause subject substitution — CONFIRMED BUG, FIXED HERE.
     #
@@ -368,8 +441,22 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
 
 # --------------------------------------------------------------------
 # 6. SELF-CHECK — fails loudly if known structural bugs have regressed
+#    ON THE FIVE-SENTENCE DEMO CORPUS SPECIFICALLY.
+#
+# CONFIRMED BUG (from real corpus run on the Eldoria story): this check
+# previously ran unconditionally and printed "SELF-CHECK FAILURES" for
+# 'chase' and 'give' simply because that corpus contains no such verbs —
+# a false alarm with zero relationship to the corpus's actual quality.
+# It is now gated behind `is_demo_corpus` and is a no-op for any other
+# corpus. It is NOT a substitute for inspecting real output on real
+# corpora — it only catches regressions on the five known toy sentences.
 # --------------------------------------------------------------------
-def run_self_checks(output):
+def run_self_checks(output, is_demo_corpus=True):
+    if not is_demo_corpus:
+        print("\n(Self-checks skipped — not the demo corpus. "
+              "Inspect the event dump manually instead.)")
+        return True
+
     events = output['events']
     by_type = {}
     for e in events:
@@ -444,74 +531,36 @@ def dump_events(output):
 
 
 if __name__ == "__main__":
+    print(">>> RUNNING preprocess.py VERSION: v5-passive-and-control-verb-fix <<<")
     parser = argparse.ArgumentParser()
-    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--debug', action='store_true',
+                         help='Print full dependency parse for every sentence')
+    parser.add_argument('--corpus-file', type=str, default=None,
+                         help='Path to a text file with one sentence per line. '
+                              'If omitted, runs the 5-sentence demo corpus.')
+    parser.add_argument('--output', type=str, default=None,
+                         help='Output pickle path. Defaults to demo_graph_corpus.pkl '
+                              'for the demo, or <corpus-file>_graph.pkl otherwise.')
     args = parser.parse_args()
 
-    # ---- REPLACE WITH ELDORIA STORY ----
-    corpus = [
-        "Leo was a young adventurer from the village of Eldoria.",
-        "Mia was his best friend and the smartest person he knew.",
-        "Sam was their clumsy but loyal companion.",
-        "One day, Leo found an old map in his grandfather's attic.",
-        "The map showed the way to the Lost Treasure of Eldoria.",
-        "Leo showed the map to Mia and Sam.",
-        "Mia studied the map carefully.",
-        "She noticed a hidden path through the Whispering Forest.",
-        "Sam accidentally tore the map while examining it.",
-        "Everyone laughed, but they were still excited.",
-        "They packed their bags with food and water.",
-        "They set out at sunrise the next morning.",
-        "The Whispering Forest was dark and eerie.",
-        "Strange sounds echoed through the trees.",
-        "Mia used her knowledge of stars to guide them.",
-        "Leo hacked through the thick bushes with a knife.",
-        "Sam tripped over a root and fell into a muddy puddle.",
-        "They finally reached the center of the forest.",
-        "In the center stood an ancient stone door.",
-        "The door was covered in strange symbols.",
-        "Mia realized the symbols were a riddle.",
-        "Leo solved the riddle by saying the password aloud.",
-        "The stone door creaked open.",
-        "Behind the door was a dark cave.",
-        "The cave was cold and damp.",
-        "They lit a torch to see inside.",
-        "The torchlight revealed a narrow tunnel.",
-        "They walked through the tunnel for hours.",
-        "Sam kept complaining about his wet shoes.",
-        "Mia told him to be quiet and listen for danger.",
-        "They heard the sound of running water.",
-        "They emerged from the tunnel into a massive underground cavern.",
-        "Inside the cavern was a raging underground river.",
-        "There was no bridge to cross the river.",
-        "Leo spotted a broken rope bridge on the other side.",
-        "They needed to get across to reach the treasure.",
-        "Mia suggested they build a raft from fallen wood.",
-        "They worked together to build a sturdy raft.",
-        "The raft barely held together as they crossed.",
-        "Sam nearly fell into the river twice.",
-        "They made it safely to the other side.",
-        "There, they found a golden chest.",
-        "The chest was locked with a heavy iron lock.",
-        "Mia tried to pick the lock with a hairpin.",
-        "She managed to open the lock after several attempts.",
-        "Inside the chest, there was no gold.",
-        "Instead, there was a single, glowing crystal.",
-        "The crystal pulsed with a warm, magical light.",
-        "Mia knew immediately that the crystal was priceless.",
-        "Leo placed the crystal carefully in his backpack.",
-        "They decided to head back to Eldoria.",
-        "On their way back, they used the raft to cross the river again.",
-        "They passed through the tunnel and the stone door.",
-        "The Whispering Forest seemed less scary on the way back.",
-        "They arrived in Eldoria as heroes.",
-        "The village elder congratulated them on their success.",
-        "Leo, Mia, and Sam were proud of their adventure.",
-        "They placed the glowing crystal in the village square.",
-        "The crystal brought good luck and prosperity to Eldoria.",
-        "Leo, Mia, and Sam remained best friends forever."
-    ]
+    is_demo = args.corpus_file is None
 
-    output = preprocess(corpus, output_file='eldoria_graph_corpus.pkl', debug=args.debug)
-    ok = run_self_checks(output)
+    if is_demo:
+        corpus = [
+            "John hit the ball.",
+            "The ball hit John.",
+            "Do you go to church on Sundays?",
+            "The cat that chased the mouse is black.",
+            "She gave him a book.",
+        ]
+        output_file = args.output or 'demo_graph_corpus.pkl'
+    else:
+        with open(args.corpus_file) as f:
+            corpus = [line.strip() for line in f if line.strip()]
+        output_file = args.output or (args.corpus_file.rsplit('.', 1)[0] + '_graph.pkl')
+
+    output = preprocess(corpus, output_file=output_file, debug=args.debug)
+    ok = run_self_checks(output, is_demo_corpus=is_demo)
+    dump_events(output)
     sys.exit(0 if ok else 1)
+

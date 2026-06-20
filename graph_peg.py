@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # graph_peg.py — The Graph‑PEG engine.
-# VERSION MARKER: v4-contrastive-loss-fixed-appos
+# VERSION MARKER: v4.1-fix-inference-tensor
 
 import torch
 import torch.nn as nn
@@ -253,8 +253,6 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
 
         for eid in trainable_event_ids:
             slots = maskable_slots[eid]
-            # FIX: Mask multiple roles per event (we'll randomly choose one per forward pass,
-            # but we could also loop over all slots; for simplicity we keep one per step)
             role_slot_idx = random.choice(slots)
 
             if len(slots) == 1 and not skipped_single_role_note_shown:
@@ -320,7 +318,7 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (fixed appos extraction)
+# 5. NOVELTY TEST (fixed appos extraction + inference tensor fix)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     """
@@ -340,38 +338,42 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     encoder = SentenceTransformer('all-MiniLM-L6-v2')
 
     def compute_surprise_for_new_event(event_type: str, roles: List[Dict]):
-        if event_type in model.event_type_to_idx:
-            event_vec = model._get_event_type_embedding(event_type)
-            verb_status = "KNOWN"
-        else:
-            event_vec = model.event_embeddings.mean(dim=0)
-            verb_status = "NEW (using average)"
-        print(f"  Verb: '{event_type}' [{verb_status}]")
+        # Wrap everything in no_grad to avoid inference tensor issues and to save compute
+        with torch.no_grad():
+            if event_type in model.event_type_to_idx:
+                event_vec = model._get_event_type_embedding(event_type)
+                verb_status = "KNOWN"
+            else:
+                event_vec = model.event_embeddings.mean(dim=0)
+                verb_status = "NEW (using average)"
+            print(f"  Verb: '{event_type}' [{verb_status}]")
 
-        entity_projs = {}
-        for r in roles:
-            text = r['entity_text']
-            raw_emb = encoder.encode([text], convert_to_tensor=True).squeeze(0)
-            proj_emb = model.entity_proj(raw_emb.to(model.event_embeddings.device))
-            entity_projs[text] = proj_emb
+            entity_projs = {}
+            for r in roles:
+                text = r['entity_text']
+                raw_emb = encoder.encode([text], convert_to_tensor=True).squeeze(0)
+                # FIX: clone to remove inference mode
+                raw_emb = raw_emb.clone()
+                proj_emb = model.entity_proj(raw_emb.to(model.event_embeddings.device))
+                entity_projs[text] = proj_emb
 
-        surprises = {}
-        for i, r in enumerate(roles):
-            context_vec = event_vec.clone()
-            for j, other in enumerate(roles):
-                if i == j:
-                    continue
-                role_emb = model.role_proj(model._get_role_embedding(other['role']))
-                entity_emb = entity_projs[other['entity_text']]
-                context_vec = context_vec + role_emb * entity_emb
+            surprises = {}
+            for i, r in enumerate(roles):
+                context_vec = event_vec.clone()
+                for j, other in enumerate(roles):
+                    if i == j:
+                        continue
+                    role_emb = model.role_proj(model._get_role_embedding(other['role']))
+                    entity_emb = entity_projs[other['entity_text']]
+                    context_vec = context_vec + role_emb * entity_emb
 
-            pred_emb = model._predict_filler(context_vec, r['role'])
-            target_emb = entity_projs[r['entity_text']]
-            sim = F.cosine_similarity(pred_emb.unsqueeze(0), target_emb.unsqueeze(0)).item()
-            surprise = 1 - sim
-            surprises[r['role']] = surprise
+                pred_emb = model._predict_filler(context_vec, r['role'])
+                target_emb = entity_projs[r['entity_text']]
+                sim = F.cosine_similarity(pred_emb.unsqueeze(0), target_emb.unsqueeze(0)).item()
+                surprise = 1 - sim
+                surprises[r['role']] = surprise
 
-        return surprises, verb_status
+            return surprises, verb_status
 
     # --- Test 1: Known verb + new modifier ---
     print("\n--- Test 1: Known verb 'be' + NEW modifier 'carpenter' ---")
@@ -463,7 +465,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v4-contrastive-loss-fixed-appos <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v4.1-fix-inference-tensor <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")

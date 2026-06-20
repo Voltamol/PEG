@@ -288,10 +288,10 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     """
-    Tests a completely new sentence (not in the training corpus) against the
-    trained model. Computes surprise for each role.
-
-    This demonstrates whether the model can detect novel entities or actions.
+    Tests three novelty scenarios:
+    1. Known verb + new modifier
+    2. New verb + known filler
+    3. New verb + completely new entities
     """
     import spacy
     from sentence_transformers import SentenceTransformer
@@ -300,39 +300,27 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     print("NOVELTY TEST (Option C in action)")
     print("="*60)
 
-    # Load the parser and encoder (same as preprocess.py)
     nlp = spacy.load('en_core_web_sm')
     encoder = SentenceTransformer('all-MiniLM-L6-v2')
 
     def compute_surprise_for_new_event(event_type: str, roles: List[Dict]):
-        """
-        roles: list of {'role': 'AGENT', 'entity_text': 'Leo'}
-        Returns: dict of surprise per role.
-        """
-        # 1. Get event embedding (or fallback)
         if event_type in model.event_type_to_idx:
             event_vec = model._get_event_type_embedding(event_type)
             verb_status = "KNOWN"
         else:
-            # Fallback: use the average of all known event embeddings as a proxy
             event_vec = model.event_embeddings.mean(dim=0)
             verb_status = "NEW (using average)"
         print(f"  Verb: '{event_type}' [{verb_status}]")
 
-        # 2. Embed and project entities
         entity_projs = {}
         for r in roles:
             text = r['entity_text']
-            # Encode with MiniLM
             raw_emb = encoder.encode([text], convert_to_tensor=True).squeeze(0)
-            # Project to hidden_dim
             proj_emb = model.entity_proj(raw_emb.to(model.event_embeddings.device))
             entity_projs[text] = proj_emb
 
-        # 3. For each role, compute surprise
         surprises = {}
         for i, r in enumerate(roles):
-            # Build context EXCLUDING this role
             context_vec = event_vec.clone()
             for j, other in enumerate(roles):
                 if i == j:
@@ -341,7 +329,6 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
                 entity_emb = entity_projs[other['entity_text']]
                 context_vec = context_vec + role_emb * entity_emb
 
-            # Predict filler
             pred_emb = model._predict_filler(context_vec, r['role'])
             target_emb = entity_projs[r['entity_text']]
             sim = F.cosine_similarity(pred_emb.unsqueeze(0), target_emb.unsqueeze(0)).item()
@@ -350,7 +337,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
         return surprises, verb_status
 
-    # --- Test 1: Known verb, new modifier ---
+    # --- Test 1: Known verb + new modifier ---
     print("\n--- Test 1: Known verb 'be' + NEW modifier 'carpenter' ---")
     new_sentence1 = "Leo was a carpenter."
     doc1 = nlp(new_sentence1)
@@ -360,14 +347,14 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for child in root1.children:
         if child.dep_ == 'nsubj':
             roles1.append({'role': 'AGENT', 'entity_text': child.text})
-        elif child.dep_ == 'attr' or child.dep_ == 'acomp':
+        elif child.dep_ in ('attr', 'acomp'):
             roles1.append({'role': 'MODIFIER', 'entity_text': child.text})
     print(f"  Sentence: {new_sentence1!r}")
     surprises1, status1 = compute_surprise_for_new_event(event_type1, roles1)
     for role, val in surprises1.items():
         print(f"    {role}: surprise={val:.4f}")
 
-    # --- Test 2: New verb, known filler ---
+    # --- Test 2: New verb + known filler ---
     print("\n--- Test 2: NEW verb 'dance' + known filler 'John' ---")
     new_sentence2 = "John danced."
     doc2 = nlp(new_sentence2)
@@ -382,15 +369,44 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for role, val in surprises2.items():
         print(f"    {role}: surprise={val:.4f}")
 
+    # --- Test 3: NEW verb + NEW entities ---
+    print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
+    new_sentence3 = "Zorp the alien arrived."
+    doc3 = nlp(new_sentence3)
+    root3 = [t for t in doc3 if t.dep_ == 'ROOT'][0]
+    event_type3 = root3.lemma_
+    roles3 = []
+
+    for child in root3.children:
+        if child.dep_ == 'nsubj':
+            roles3.append({'role': 'AGENT', 'entity_text': child.text})
+        elif child.dep_ == 'appos':
+            roles3.append({'role': 'MODIFIER', 'entity_text': child.text})
+        elif child.dep_ == 'det':
+            pass  # ignore "the"
+
+    # Fallback: if no MODIFIER found, check for appos attached to nsubj
+    if not any(r['role'] == 'MODIFIER' for r in roles3):
+        for token in doc3:
+            if token.dep_ == 'appos' and token.head.dep_ == 'nsubj':
+                roles3.append({'role': 'MODIFIER', 'entity_text': token.text})
+                break
+
+    print(f"  Sentence: {new_sentence3!r}")
+    surprises3, status3 = compute_surprise_for_new_event(event_type3, roles3)
+    for role, val in surprises3.items():
+        print(f"    {role}: surprise={val:.4f}")
+
     # --- Interpretation ---
     print("\n--- Interpretation ---")
-    print("  - Test 1: 'carpenter' is a new MODIFIER for the known verb 'be'.")
-    print(f"    Surprise for MODIFIER: {surprises1.get('MODIFIER', 0.0):.4f}")
-    print("    If > 0.3, the model detects the new entity. If < 0.1, it generalises well.")
-    print("  - Test 2: 'dance' is a new verb with the known AGENT 'John'.")
-    print(f"    Surprise for AGENT: {surprises2.get('AGENT', 0.0):.4f}")
-    print("    High surprise indicates the model treats the novel action as unexpected.")
-    print("  - This is the core of PEG's novelty detection: surprise drives spawning.")
+    print(f"  Test 1 (carpenter): MODIFIER surprise = {surprises1.get('MODIFIER', 0.0):.4f}")
+    print(f"  Test 2 (dance):    AGENT surprise    = {surprises2.get('AGENT', 0.0):.4f}")
+    print(f"  Test 3 (Zorp):     AGENT surprise    = {surprises3.get('AGENT', 0.0):.4f}")
+    print(f"  Test 3 (alien):    MODIFIER surprise = {surprises3.get('MODIFIER', 0.0):.4f}")
+    print()
+    print("  Expected: Test 1 < 0.1 (known verb, new modifier should generalise).")
+    print("            Test 2 > 0.2 (new verb, surprise should be moderate).")
+    print("            Test 3 > 0.3 (completely new event – highest surprise).")
 # --------------------------------------------------------------------
 # 5. MAIN
 # --------------------------------------------------------------------

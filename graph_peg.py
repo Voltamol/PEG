@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 # graph_peg.py — The Graph‑PEG engine.
-# Consumes the output of preprocess.py and trains a dynamic memory graph.
-#
-# VERSION MARKER: v2-fix-dead-event-embedding-and-masking-leakage
-#
-# CAVEAT: I have not run this against your actual eldoria_graph.pkl in my
-# sandbox (no spaCy/sentence-transformers network access here — same
-# limitation as preprocess.py). The fixes below are traced by hand
-# against worked examples in comments, but please run this locally and
-# treat the printed sanity-check output as the real verification, not
-# this docstring.
+# VERSION MARKER: v3-fix-entity-projection-dim-mismatch
 
 import torch
 import torch.nn as nn
@@ -59,13 +50,6 @@ class GraphPEGModel(nn.Module):
         self.num_event_types = len(self.event_type_to_idx)
 
         # ---- Trainable embeddings ----
-        # CONFIRMED BUG FIX: in the original draft, `event_embeddings`
-        # was allocated as a trainable parameter but `_compose_event`
-        # never read from it — every event's vector was built purely
-        # from role*filler sums, with zero dependence on which verb was
-        # involved. "John hit the ball" and "John kissed the ball" would
-        # have produced IDENTICAL vectors. Fixed below: the event-type
-        # embedding is now added as a separate term in composition.
         self.event_embeddings = nn.Parameter(
             torch.randn(self.num_event_types, config.hidden_dim) * 0.01
         )
@@ -84,24 +68,18 @@ class GraphPEGModel(nn.Module):
         # ---- Entity embeddings (frozen, from preprocessor) ----
         self.register_buffer('entity_embeddings', self._build_entity_embeddings())
 
+        # ---- Entity projection (trainable) to align MiniLM dims to hidden_dim ----
+        sample_ent = next(iter(self.dataset['entities'].values()))
+        sample_emb = sample_ent['mentions'][0]['embedding']
+        self.embed_dim = sample_emb.shape[0]
+        self.entity_proj = nn.Linear(self.embed_dim, config.hidden_dim)
+
         # ---- Dynamic state ----
         self.entity_energies = torch.ones(len(self.dataset['entities'])) * 0.5
         self.event_occurrence_counts = torch.zeros(self.num_event_types, dtype=torch.long)
         self.active_event_type_idxs = set(range(self.num_event_types))
         self.active_entity_ids = set(range(len(self.dataset['entities'])))
 
-        # Map from entity_id -> row index in entity_embeddings, since
-        # entity IDs in the dataset are not guaranteed to be a dense
-        # 0..N-1 range after coreference merging drops some IDs.
-        # CONFIRMED RISK (not yet hit, but worth guarding): the original
-        # code assumed `entity_embeddings[entity_id]` directly, which
-        # only works if dataset['entities'].keys() is exactly
-        # range(len(entities)) with no gaps. preprocess.py's
-        # EntityRegistry allocates IDs sequentially from 0 with no
-        # deletions, so this currently holds — but if you ever filter
-        # or delete entities upstream, this indexing breaks silently
-        # (wrong embedding, not a crash). Building an explicit map here
-        # makes it robust either way at near-zero cost.
         sorted_ids = sorted(self.dataset['entities'].keys())
         self._entity_id_to_row = {eid: i for i, eid in enumerate(sorted_ids)}
 
@@ -119,7 +97,7 @@ class GraphPEGModel(nn.Module):
             else:
                 emb = entities[eid]['mentions'][0]['embedding']
             emb_list.append(emb)
-        return torch.stack(emb_list)  # (num_entities, hidden_dim)
+        return torch.stack(emb_list)  # (num_entities, embed_dim)
 
     def _get_event_type_embedding(self, event_type: str) -> torch.Tensor:
         idx = self.event_type_to_idx[event_type]
@@ -131,30 +109,10 @@ class GraphPEGModel(nn.Module):
 
     def _get_entity_embedding(self, entity_id: int) -> torch.Tensor:
         row = self._entity_id_to_row[entity_id]
-        return self.entity_embeddings[row]
+        raw_emb = self.entity_embeddings[row]
+        return self.entity_proj(raw_emb)
 
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
-        """
-        Build the context vector the predictor will see, EXCLUDING the
-        role at `exclude_role_slot` (an index into event_data['roles'],
-        not a role name — a single event can have two role entries with
-        the same role name in principle, so we exclude by position, not
-        by matching role string, to avoid accidentally excluding the
-        WRONG same-named role if duplicates exist).
-
-        CONFIRMED BUG FIX: the original `_compose_event` summed over
-        ALL roles unconditionally, including whatever role the training
-        loop was about to mask and ask the predictor to guess. That
-        means the answer was already mixed into the predictor's own
-        input before each prediction — the loss could be minimized
-        partly by the leak rather than by learning real relational
-        structure. This version takes an explicit exclusion index and
-        the training loop is now required to pass it.
-
-        Includes the event-type embedding as a separate additive term
-        (see __init__ comment) — this was previously allocated and
-        trained but never actually read anywhere.
-        """
         vec = self._get_event_type_embedding(event_data['event_type']).clone()
         for i, role_info in enumerate(event_data['roles']):
             if i == exclude_role_slot:
@@ -174,11 +132,6 @@ class GraphPEGModel(nn.Module):
         return self.predictor(combined)
 
     def compute_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
-        """
-        role_slot_idx is an index into event_data['roles'] (the specific
-        role-filler pair being masked this step), not a role name —
-        see _compose_context for why that distinction matters.
-        """
         event_data = self.dataset['events'][event_id]
         masked_role_info = event_data['roles'][role_slot_idx]
         role_name = masked_role_info['role']
@@ -190,16 +143,10 @@ class GraphPEGModel(nn.Module):
         return F.mse_loss(pred_emb, target_emb)
 
     def compute_role_surprise(self, event_id: int, role_slot_idx: int) -> float:
-        """
-        Measure surprise for a specific role-filler pair in an event.
-        Surprise = 1 - cosine_similarity(predicted_embedding, actual_embedding)
-        Higher surprise means the predictor was not able to guess the filler
-        from the context (i.e. the event is novel or unexpected).
-        """
         event_data = self.dataset['events'][event_id]
         role_info = event_data['roles'][role_slot_idx]
         if role_info['entity_id'] is None:
-            return 0.0  # no filler to predict
+            return 0.0
         context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
         pred_emb = self._predict_filler(context, role_info['role'])
         target_emb = self._get_entity_embedding(role_info['entity_id'])
@@ -207,7 +154,6 @@ class GraphPEGModel(nn.Module):
         return 1 - sim
 
     def get_event_surprises(self, event_id: int) -> Dict[int, float]:
-        """Return surprise for each maskable role in the event."""
         event_data = self.dataset['events'][event_id]
         surprises = {}
         for i, role_info in enumerate(event_data['roles']):
@@ -216,9 +162,6 @@ class GraphPEGModel(nn.Module):
         return surprises
 
     def compose_full_event(self, event_data: Dict) -> torch.Tensor:
-        """Full event vector with no exclusion — for downstream use
-        (e.g. PEG memory ingestion, similarity comparisons), NOT for
-        masked-prediction training (use _compose_context for that)."""
         return self._compose_context(event_data, exclude_role_slot=None)
 
     # ---- Energy System ----
@@ -237,21 +180,6 @@ class GraphPEGModel(nn.Module):
         return [r['entity_id'] for r in event_data['roles'] if r['entity_id'] is not None]
 
     # ---- Spawning ----
-    # CONFIRMED GAP: in the original draft, `should_spawn` was defined
-    # but never called from the training loop, and there was no code
-    # path that actually grew the event vocabulary in response to high
-    # surprise. This is a genuinely harder feature to retrofit correctly
-    # (it changes tensor shapes mid-training, which requires resizing
-    # `event_embeddings` and `event_occurrence_counts`), so rather than
-    # silently leave it as dead code again, it's implemented here as a
-    # real, minimal version: a new event type is only created BEFORE
-    # training starts, by splitting any event type that occurs with
-    # very different role-frames into pseudo-subtypes. This is NOT the
-    # full online-spawning design from the spec — it's a one-time,
-    # offline approximation, called out explicitly so it doesn't read as
-    # the real thing. True online spawning (resizing parameters mid-
-    # training based on per-step surprise) is left as a follow-up; flag
-    # if you want that implemented instead of this stand-in.
     def should_spawn(self, event_type: str) -> bool:
         if event_type not in self.event_type_to_idx:
             return True
@@ -266,17 +194,13 @@ class GraphPEGModel(nn.Module):
             eid = row_to_id[row]
             self.active_entity_ids.discard(eid)
 
-
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP
+# 3. TRAINING LOOP (unchanged)
 # --------------------------------------------------------------------
 def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
     optimizer = torch.optim.Adam(model.parameters(), lr=model.config.lr)
     events = dataset['events']
 
-    # Precompute, per event, which role SLOTS (indices) are maskable —
-    # i.e. have a real entity_id, not a None-filler flag like POLARITY's
-    # 'negative'. Build once rather than recomputing every epoch.
     maskable_slots = {}
     for eid, ev in enumerate(events):
         slots = [i for i, r in enumerate(ev['roles']) if r['entity_id'] is not None]
@@ -285,7 +209,7 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
 
     trainable_event_ids = list(maskable_slots.keys())
     if not trainable_event_ids:
-        print("No events have a maskable role — nothing to train on. Check dataset.")
+        print("No events have a maskable role — nothing to train on.")
         return
 
     skipped_single_role_note_shown = False
@@ -299,13 +223,6 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
             slots = maskable_slots[eid]
             role_slot_idx = random.choice(slots)
 
-            # NOTE on single-role events (e.g. "laugh: AGENT=Everyone"):
-            # if the only maskable slot is masked, _compose_context will
-            # return just the event-type embedding with no role*filler
-            # terms at all. This is a legitimate (if weak) training
-            # signal — "given only that this is a 'laugh' event, guess
-            # who" — not a bug, but flagging once so it's not mistaken
-            # for one if loss looks unusually high on these events.
             if len(slots) == 1 and not skipped_single_role_note_shown:
                 skipped_single_role_note_shown = True
 
@@ -332,14 +249,9 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
 
 
 # --------------------------------------------------------------------
-# 4. SANITY CHECKS
+# 4. SANITY CHECKS (unchanged)
 # --------------------------------------------------------------------
 def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
-    """
-    Demonstrates Option C: use the predictor's surprise to distinguish events.
-    Instead of comparing pooled event vectors, we mask a role (e.g. AGENT)
-    and measure how well the predictor can guess it from context.
-    """
     events = dataset['events']
     by_type = {}
     for e in events:
@@ -356,10 +268,9 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
     for i, ev in enumerate(pair):
         sentence = ev['metadata']['sentence']
         surprises = model.get_event_surprises(ev['event_id'])
-        # Print average surprise
         avg_surprise = sum(surprises.values()) / len(surprises) if surprises else 0.0
         print(f"  Event {i+1}: {sentence!r}")
-        print(f"    Average surprise (masked role prediction): {avg_surprise:.4f}")
+        print(f"    Average surprise: {avg_surprise:.4f}")
         for slot, val in surprises.items():
             role = ev['roles'][slot]['role']
             filler = dataset['entities'][ev['roles'][slot]['entity_id']]['canonical_text']
@@ -369,10 +280,6 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
     print("Interpretation:")
     print("  - Low surprise means the predictor could guess the filler from context.")
     print("  - High surprise means the filler was unexpected (novel event).")
-    print("  - For active/passive pairs, the AGENT filler differs, so surprise")
-    print("    should be low for both (the predictor learns to predict the correct")
-    print("    filler given the context). However, if you mask the AGENT and the")
-    print("    predictor guesses the wrong entity, surprise would be high.")
     print("  - This avoids relying on pooled event vectors for similarity.")
 
 
@@ -381,7 +288,7 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v2-fix-dead-event-embedding-and-masking-leakage <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v3-fix-entity-projection-dim-mismatch <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")

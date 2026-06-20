@@ -437,4 +437,21 @@ if __name__ == "__main__":
 
     output = preprocess(corpus, output_file='demo_graph_corpus.pkl', debug=args.debug)
     ok = run_self_checks(output)
+    dump_events(output)
     sys.exit(0 if ok else 1)
+
+# --------------------------------------------------------------------
+# Quick standalone inspector — paste this output back for review
+# --------------------------------------------------------------------
+def dump_events(output):
+    print("\n=== FULL EVENT DUMP ===")
+    for e in output['events']:
+        role_strs = []
+        for r in e['roles']:
+            if r['entity_id'] is None:
+                filler = '(flag)'
+            else:
+                filler = output['entities'][r['entity_id']]['canonical_text']
+            role_strs.append(f"{r['role']}={filler}(conf={r['confidence']})")
+        print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
+              f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")

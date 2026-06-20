@@ -224,16 +224,31 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             roles.append({'role': 'POLARITY', 'entity_text': 'negative',
                           'is_pronoun': False})
 
-    # Relative clause / clausal subject: if this predicate's own subject
-    # slot is empty, check if it's attached via `relcl` to a noun in a
-    # different clause (e.g. "chased" in "cat that chased the mouse" —
-    # the head noun "cat" is the *implicit* subject of "chased" via the
-    # relative pronoun, even though "that"/"who" itself is what attaches
-    # under nsubj in many UD parses).
-    if not any(r['role'] == 'AGENT' for r in roles) and pred_token.dep_ == 'relcl':
-        implicit_subject = pred_token.head  # the noun this clause modifies
-        roles.append({'role': 'AGENT', 'entity_text': implicit_subject.text,
-                      'is_pronoun': False})
+    # Relative clause subject substitution — CONFIRMED BUG, FIXED HERE.
+    #
+    # Verified against real spaCy output on "The cat that chased the mouse
+    # is black": "that" IS tagged nsubj of "chased" (the slot is NOT
+    # empty), so the original "only fill AGENT if empty" check never
+    # fired. The relative pronoun ("that"/"which"/"who") was being stored
+    # as the literal AGENT filler, which is meaningless — it has no
+    # real-world referent. The actual agent ("cat") was being dropped.
+    #
+    # Fix: detect when an AGENT (or any role) filler IS a relative
+    # pronoun, and substitute the antecedent (pred_token.head — the noun
+    # this relative clause modifies) instead of just checking for an
+    # empty slot.
+    RELATIVE_PRONOUNS = {'that', 'which', 'who', 'whom', 'whose'}
+    if pred_token.dep_ == 'relcl':
+        antecedent = pred_token.head.text
+        for r in roles:
+            if r['entity_text'].lower() in RELATIVE_PRONOUNS:
+                r['entity_text'] = antecedent
+                r['is_pronoun'] = False  # it's now resolved to the real noun
+        if not any(r['role'] == 'AGENT' for r in roles):
+            # Truly empty subject slot (different parse shape) — fall
+            # back to the antecedent directly.
+            roles.append({'role': 'AGENT', 'entity_text': antecedent,
+                          'is_pronoun': False})
 
     mood = 'interrogative' if doc.text.strip().endswith('?') else 'declarative'
     polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
@@ -360,9 +375,24 @@ def run_self_checks(output):
     if 'chase' not in by_type:
         errors.append("Expected an event for 'chase' (from 'chased') — "
                        "relative clause extraction is broken.")
-    elif not any(r['role'] == 'AGENT' for r in by_type['chase'][0]['roles']):
-        errors.append("'chase' event has no AGENT — implicit relcl subject "
-                       "resolution is broken.")
+    else:
+        chase_roles = by_type['chase'][0]['roles']
+        agent_roles = [r for r in chase_roles if r['role'] == 'AGENT']
+        if not agent_roles:
+            errors.append("'chase' event has no AGENT — implicit relcl subject "
+                           "resolution is broken.")
+        else:
+            # Check the FILLER, not just presence — this is the check that
+            # was missing before and let "AGENT=that" pass as correct.
+            agent_id = agent_roles[0]['entity_id']
+            agent_text = output['entities'][agent_id]['canonical_text'].lower() if agent_id is not None else None
+            if agent_text in ('that', 'which', 'who', 'whom'):
+                errors.append(f"'chase' event's AGENT filler is the relative "
+                               f"pronoun '{agent_text}', not the antecedent noun "
+                               f"('cat') — relative pronoun substitution is broken.")
+            elif agent_text != 'cat':
+                errors.append(f"'chase' event's AGENT filler is '{agent_text}', "
+                               f"expected 'cat'.")
 
     if 'give' not in by_type:
         errors.append("Expected an event for 'give' (from 'gave').")
@@ -391,6 +421,23 @@ def run_self_checks(output):
 # --------------------------------------------------------------------
 # 7. DEMO
 # --------------------------------------------------------------------
+# --------------------------------------------------------------------
+# Quick standalone inspector — paste this output back for review
+# --------------------------------------------------------------------
+def dump_events(output):
+    print("\n=== FULL EVENT DUMP ===")
+    for e in output['events']:
+        role_strs = []
+        for r in e['roles']:
+            if r['entity_id'] is None:
+                filler = '(flag)'
+            else:
+                filler = output['entities'][r['entity_id']]['canonical_text']
+            role_strs.append(f"{r['role']}={filler}(conf={r['confidence']})")
+        print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
+              f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
@@ -407,4 +454,6 @@ if __name__ == "__main__":
 
     output = preprocess(corpus, output_file='demo_graph_corpus.pkl', debug=args.debug)
     ok = run_self_checks(output)
+    dump_events(output)
     sys.exit(0 if ok else 1)
+

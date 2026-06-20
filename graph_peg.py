@@ -369,7 +369,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for role, val in surprises2.items():
         print(f"    {role}: surprise={val:.4f}")
 
-    # --- Test 3: NEW verb + NEW entities ---
+        # --- Test 3: NEW verb + NEW entities (fixed appos extraction) ---
     print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
     new_sentence3 = "Zorp the alien arrived."
     doc3 = nlp(new_sentence3)
@@ -377,15 +377,23 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     event_type3 = root3.lemma_
     roles3 = []
 
+    subj_token = None
     for child in root3.children:
         if child.dep_ == 'nsubj':
+            subj_token = child
             roles3.append({'role': 'AGENT', 'entity_text': child.text})
-        elif child.dep_ == 'appos':
-            roles3.append({'role': 'MODIFIER', 'entity_text': child.text})
         elif child.dep_ == 'det':
             pass  # ignore "the"
+        # Note: appos is usually NOT a child of the verb root in spaCy,
+        # it's a child of the noun it modifies.
 
-    # Fallback: if no MODIFIER found, check for appos attached to nsubj
+    # Now check the subject's children for appositive
+    if subj_token:
+        for child in subj_token.children:
+            if child.dep_ == 'appos':
+                roles3.append({'role': 'MODIFIER', 'entity_text': child.text})
+
+    # Fallback: if still no MODIFIER, scan the doc for any appos attached to nsubj
     if not any(r['role'] == 'MODIFIER' for r in roles3):
         for token in doc3:
             if token.dep_ == 'appos' and token.head.dep_ == 'nsubj':
@@ -393,10 +401,11 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
                 break
 
     print(f"  Sentence: {new_sentence3!r}")
+    print(f"  Extracted roles: {[(r['role'], r['entity_text']) for r in roles3]}")
     surprises3, status3 = compute_surprise_for_new_event(event_type3, roles3)
     for role, val in surprises3.items():
         print(f"    {role}: surprise={val:.4f}")
-
+        
     # --- Interpretation ---
     print("\n--- Interpretation ---")
     print(f"  Test 1 (carpenter): MODIFIER surprise = {surprises1.get('MODIFIER', 0.0):.4f}")

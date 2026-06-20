@@ -444,22 +444,74 @@ def dump_events(output):
 
 
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v4-location-prep-fix <<<")
     parser = argparse.ArgumentParser()
-    parser.add_argument('--debug', action='store_true',
-                         help='Print full dependency parse for every sentence')
+    parser.add_argument('--debug', action='store_true')
     args = parser.parse_args()
 
+    # ---- REPLACE WITH ELDORIA STORY ----
     corpus = [
-        "John hit the ball.",
-        "The ball hit John.",
-        "Do you go to church on Sundays?",
-        "The cat that chased the mouse is black.",
-        "She gave him a book.",
+        "Leo was a young adventurer from the village of Eldoria.",
+        "Mia was his best friend and the smartest person he knew.",
+        "Sam was their clumsy but loyal companion.",
+        "One day, Leo found an old map in his grandfather's attic.",
+        "The map showed the way to the Lost Treasure of Eldoria.",
+        "Leo showed the map to Mia and Sam.",
+        "Mia studied the map carefully.",
+        "She noticed a hidden path through the Whispering Forest.",
+        "Sam accidentally tore the map while examining it.",
+        "Everyone laughed, but they were still excited.",
+        "They packed their bags with food and water.",
+        "They set out at sunrise the next morning.",
+        "The Whispering Forest was dark and eerie.",
+        "Strange sounds echoed through the trees.",
+        "Mia used her knowledge of stars to guide them.",
+        "Leo hacked through the thick bushes with a knife.",
+        "Sam tripped over a root and fell into a muddy puddle.",
+        "They finally reached the center of the forest.",
+        "In the center stood an ancient stone door.",
+        "The door was covered in strange symbols.",
+        "Mia realized the symbols were a riddle.",
+        "Leo solved the riddle by saying the password aloud.",
+        "The stone door creaked open.",
+        "Behind the door was a dark cave.",
+        "The cave was cold and damp.",
+        "They lit a torch to see inside.",
+        "The torchlight revealed a narrow tunnel.",
+        "They walked through the tunnel for hours.",
+        "Sam kept complaining about his wet shoes.",
+        "Mia told him to be quiet and listen for danger.",
+        "They heard the sound of running water.",
+        "They emerged from the tunnel into a massive underground cavern.",
+        "Inside the cavern was a raging underground river.",
+        "There was no bridge to cross the river.",
+        "Leo spotted a broken rope bridge on the other side.",
+        "They needed to get across to reach the treasure.",
+        "Mia suggested they build a raft from fallen wood.",
+        "They worked together to build a sturdy raft.",
+        "The raft barely held together as they crossed.",
+        "Sam nearly fell into the river twice.",
+        "They made it safely to the other side.",
+        "There, they found a golden chest.",
+        "The chest was locked with a heavy iron lock.",
+        "Mia tried to pick the lock with a hairpin.",
+        "She managed to open the lock after several attempts.",
+        "Inside the chest, there was no gold.",
+        "Instead, there was a single, glowing crystal.",
+        "The crystal pulsed with a warm, magical light.",
+        "Mia knew immediately that the crystal was priceless.",
+        "Leo placed the crystal carefully in his backpack.",
+        "They decided to head back to Eldoria.",
+        "On their way back, they used the raft to cross the river again.",
+        "They passed through the tunnel and the stone door.",
+        "The Whispering Forest seemed less scary on the way back.",
+        "They arrived in Eldoria as heroes.",
+        "The village elder congratulated them on their success.",
+        "Leo, Mia, and Sam were proud of their adventure.",
+        "They placed the glowing crystal in the village square.",
+        "The crystal brought good luck and prosperity to Eldoria.",
+        "Leo, Mia, and Sam remained best friends forever."
     ]
 
-    output = preprocess(corpus, output_file='demo_graph_corpus.pkl', debug=args.debug)
+    output = preprocess(corpus, output_file='eldoria_graph_corpus.pkl', debug=args.debug)
     ok = run_self_checks(output)
-    dump_events(output)
     sys.exit(0 if ok else 1)
-

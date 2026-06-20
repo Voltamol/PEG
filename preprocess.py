@@ -227,8 +227,17 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             roles.append({'role': 'PATIENT', 'entity_text': child.text,
                           'is_pronoun': child.text.lower() in PRONOUNS})
         elif dep in ('iobj', 'dative'):
-            roles.append({'role': 'RECIPIENT', 'entity_text': child.text,
-                          'is_pronoun': child.text.lower() in PRONOUNS})
+            # CONFIRMED BUG: spaCy sometimes tags `dative` directly on a
+            # noun ("him" in "gave him a book") but sometimes on the
+            # PREPOSITION itself ("to" in "showed the map to Mia and
+            # Sam"). The original code always used child.text, which
+            # produced the literal entity "to" for the second case —
+            # a meaningless filler. Fix: if the dative-tagged token has
+            # its own pobj child, use that instead.
+            prep_objs = [c for c in child.children if c.dep_ == 'pobj']
+            filler = prep_objs[0] if prep_objs else child
+            roles.append({'role': 'RECIPIENT', 'entity_text': filler.text,
+                          'is_pronoun': filler.text.lower() in PRONOUNS})
         elif dep == 'attr' or dep == 'acomp':
             # Copula complement: "is black" -> black is the THEME-ish
             # complement. We file it under MODIFIER per the v1 role table
@@ -255,52 +264,61 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
     # CONFIRMED BUG from real corpus run: "Sam kept complaining about his
     # wet shoes" produced a 'complain' event with ZERO roles, because
     # "complaining" (dep=xcomp) has no nsubj child of its own — its
-    # subject is "Sam", inherited from the matrix verb "kept". Same
-    # pattern broke "get" (sentence 35), "raging"/"glowing" (now filtered
-    # out separately as amod), "be quiet"/"listen" in sentence 29, and
-    # several others.
+    # subject is "Sam", inherited from the matrix verb "kept".
     #
-    # Rule (standard control-verb distinction):
-    #   - SUBJECT CONTROL (xcomp, ccomp, advcl with no dobj on the matrix
-    #     verb): embedded subject = matrix verb's subject.
-    #     "Sam kept [complaining]" -> complaining's AGENT = Sam.
-    #   - OBJECT CONTROL (matrix verb has a dobj AND the embedded clause
-    #     is xcomp): embedded subject = matrix verb's object, not subject.
-    #     "Mia told him [to be quiet]" -> be's AGENT = him, not Mia.
-    #
-    # This is a heuristic, not a full control-verb lexicon (true object-
-    # vs-subject control depends on the specific matrix verb: "told"/
-    # "asked"/"ordered" are object control, "tried"/"decided"/"managed"/
-    # "needed" are subject control). The heuristic below — object control
-    # iff the matrix verb has its own dobj — gets this right for every
-    # verb in this corpus's run, but is NOT guaranteed for all English
-    # control verbs. Flag for review if you hit a counterexample.
-    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl', 'conj') and \
+    # SECOND CONFIRMED BUG, found on the Eldoria corpus run after the
+    # first fix: the original heuristic ("object control iff the matrix
+    # verb has a dobj") is wrong. It produced:
+    #   - "examine: AGENT=map" for "Sam tore the map while examining it"
+    #     (matrix "tore" has dobj=map, but Sam is who examines, not map)
+    #   - "guide: AGENT=knowledge" for "Mia used her knowledge to guide
+    #     them" (matrix "used" has dobj=knowledge, but Mia guides)
+    # The presence of a dobj on the matrix verb does NOT reliably predict
+    # object control. "use X to V", "need to V", "try to V" are subject
+    # control even when the matrix verb has its own object; only a
+    # specific, closed set of verbs ("tell", "ask", "order", "want",
+    # "allow", "force", "persuade", "convince", "remind", "warn") are
+    # object control. Using an explicit lexicon instead of a syntactic
+    # proxy, since the proxy demonstrably fails on real sentences.
+    OBJECT_CONTROL_VERBS = {
+        'tell', 'ask', 'order', 'want', 'allow', 'force', 'persuade',
+        'convince', 'remind', 'warn', 'permit', 'instruct', 'urge',
+    }
+
+    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl') and \
             not any(r['role'] == 'AGENT' for r in roles):
         matrix = pred_token.head
         matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
         matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
 
-        # For `conj` specifically: a verb conjoined with another verb
-        # ("be quiet and listen") inherits the SAME subject as the verb
-        # it's conjoined with, not the object — coordination doesn't
-        # change who's doing the action. Only treat matrix as having a
-        # "dobj-style" controller when the relation is xcomp/ccomp/advcl
-        # (true control), not conj (coordination).
-        if pred_token.dep_ == 'conj':
-            inherited = matrix_subj
-            # If the head we conjoined with itself had no overt subject
-            # (e.g. it inherited one via this same mechanism, like "be"
-            # inheriting "him" from "told"), matrix_subj will be None
-            # here since we only check direct .children, not inherited
-            # roles. Known limitation: chained coordination beyond one
-            # level may need a second pass. Flag if this comes up.
+        if matrix.lemma_.lower() in OBJECT_CONTROL_VERBS and matrix_dobj is not None:
+            inherited = matrix_dobj
         else:
-            inherited = matrix_dobj if matrix_dobj is not None else matrix_subj
+            inherited = matrix_subj
 
         if inherited is not None:
             roles.append({'role': 'AGENT', 'entity_text': inherited.text,
                           'is_pronoun': inherited.text.lower() in PRONOUNS})
+
+    elif pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
+        # A verb conjoined with another verb ("be quiet and listen")
+        # inherits the SAME subject as the verb it's conjoined with —
+        # coordination never changes who's doing the action, so this
+        # stays a separate, simpler rule from the control-verb lexicon
+        # above (no object-control case applies to conj at all).
+        matrix = pred_token.head
+        matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+        # KNOWN LIMITATION (unchanged from before): if `matrix` itself had
+        # no direct nsubj child because IT inherited its subject via this
+        # same mechanism (e.g. "be" inheriting "him" from "told"), this
+        # lookup only checks direct .children and will find nothing —
+        # confirmed on "listen" in "told him to be quiet and listen for
+        # danger", which still comes out AGENT-less. Needs a two-pass
+        # resolution (resolve all inherited subjects first, then let
+        # conj chains borrow from the resolved set) to fully close.
+        if matrix_subj is not None:
+            roles.append({'role': 'AGENT', 'entity_text': matrix_subj.text,
+                          'is_pronoun': matrix_subj.text.lower() in PRONOUNS})
 
     # Relative clause subject substitution — CONFIRMED BUG, FIXED HERE.
     #
@@ -531,7 +549,7 @@ def dump_events(output):
 
 
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v5-passive-and-control-verb-fix <<<")
+    print(">>> RUNNING preprocess.py VERSION: v6-control-verb-lexicon-and-dative-prep-fix <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

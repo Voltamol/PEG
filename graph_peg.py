@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg_v13.py — Verb as weak cue, larger predictor, mixed negatives
-# VERSION MARKER: v13-verb-cue-mixed-negatives
+# graph_peg_v13.1.py — Verb as weak cue, mixed negatives, fixed training loop
+# VERSION MARKER: v13.1-fixed-training-loop
 
 import torch
 import torch.nn as nn
@@ -233,7 +233,7 @@ class GraphPEGModel(nn.Module):
 
 
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP (same as v12)
+# 3. TRAINING LOOP (removed event_occurrence_counts update)
 # --------------------------------------------------------------------
 def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
     optimizer = torch.optim.Adam(model.parameters(),
@@ -266,11 +266,6 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
             loss = model.compute_loss(eid, role_slot_idx)
             loss = loss / batch_size
             loss.backward()
-
-            # update counts (not used)
-            event_type = events[eid]['event_type']
-            idx = model.event_type_to_idx[event_type]
-            model.event_occurrence_counts[idx] += 1
 
             if (i + 1) % batch_size == 0 or (i + 1) == len(trainable_event_ids):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -338,11 +333,11 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     def compute_surprise_for_new_event(event_type: str, roles: List[Dict]):
         with torch.no_grad():
             if event_type in model.event_type_to_idx:
-                event_vec = model._get_event_type_embedding(event_type)
+                verb_vec = model._get_event_type_embedding(event_type)
                 verb_status = "KNOWN"
             else:
-                event_vec = model.event_embeddings.mean(dim=0)
-                verb_status = "NEW (using average)"
+                verb_vec = torch.zeros(model.config.hidden_dim, device=model.config.device)
+                verb_status = "NEW (using zero)"
             print(f"  Verb: '{event_type}' [{verb_status}]")
 
             entity_projs = {}
@@ -356,7 +351,6 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
             surprises = {}
             for i, r in enumerate(roles):
                 # Build context with verb cue
-                verb_vec = event_vec.clone() if event_type in model.event_type_to_idx else torch.zeros_like(event_vec)
                 role_sum = torch.zeros(model.config.hidden_dim, device=model.config.device)
                 for j, other in enumerate(roles):
                     if i == j:
@@ -437,10 +431,10 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v13-verb-cue-mixed-negatives <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v13.1-fixed-training-loop <<<")
 
     if len(sys.argv) < 2:
-        print("Usage: python3 graph_peg_v13.py <graph_corpus.pkl> [epochs]")
+        print("Usage: python3 graph_peg_v13.1.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
     epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 100

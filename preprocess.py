@@ -596,6 +596,8 @@ def dump_events(output):
 
 
 if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     print(">>> RUNNING preprocess.py VERSION: v7-ambiguous-preposition-disambiguation <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',

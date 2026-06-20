@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg.py — Graph‑PEG engine v7.1 (fixed buffer, robust training)
-# VERSION MARKER: v7.1-buffer-fixed
+# graph_peg.py — Graph‑PEG engine v8 (pure InfoNCE, noise, generalisation)
+# VERSION MARKER: v8-pure-contrastive-noise
 
 import torch
 import torch.nn as nn
@@ -20,7 +20,7 @@ class GraphPEGConfig:
         self.role_dim = 64
         self.lr = 1e-3
         self.weight_decay = 1e-5
-        self.epochs = 100
+        self.epochs = 150
         self.gamma = 0.995
         self.alpha = 0.1
         self.beta = 0.05
@@ -29,10 +29,10 @@ class GraphPEGConfig:
         self.min_occurrences = 3
         self.merge_threshold = 0.95
         self.mask_prob = 0.15
-        self.num_negatives = 15
-        self.dropout = 0.1
-        self.temperature = 0.1          # initial, will be learned
-        self.mse_weight = 0.1           # auxiliary MSE weight
+        self.num_negatives = 10          # all hard negatives if possible
+        self.dropout = 0.2
+        self.temperature = 0.1
+        self.noise_std = 0.05            # std of Gaussian noise added to context
 
 
 # --------------------------------------------------------------------
@@ -64,9 +64,13 @@ class GraphPEGModel(nn.Module):
         )
         self.role_proj = nn.Linear(config.role_dim, config.hidden_dim)
 
-        # predictor: simple MLP with layer norm and dropout
+        # predictor: simple MLP with dropout
         self.predictor = nn.Sequential(
             nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.LayerNorm(config.hidden_dim),
             nn.ReLU(),
             nn.Dropout(config.dropout),
@@ -79,7 +83,7 @@ class GraphPEGModel(nn.Module):
         self.embed_dim = sample_emb.shape[0]
         self.entity_proj = nn.Linear(self.embed_dim, config.hidden_dim)
 
-        # ---- FIX: register entity embeddings buffer ----
+        # entity embeddings buffer
         self.register_buffer('entity_embeddings', self._build_entity_embeddings())
 
         # learnable temperature for InfoNCE
@@ -138,11 +142,10 @@ class GraphPEGModel(nn.Module):
 
     def _get_entity_embedding(self, entity_id: int) -> torch.Tensor:
         row = self._entity_id_to_row[entity_id]
-        raw_emb = self.entity_embeddings[row]   # now buffer exists
+        raw_emb = self.entity_embeddings[row]
         return self.entity_proj(raw_emb)
 
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
-        # event embedding + sum of role_emb * entity_emb
         vec = self._get_event_type_embedding(event_data['event_type']).clone()
         for i, role_info in enumerate(event_data['roles']):
             if i == exclude_role_slot:
@@ -161,7 +164,7 @@ class GraphPEGModel(nn.Module):
         combined = torch.cat([context_vec, role_emb], dim=-1)
         return self.predictor(combined)
 
-    # ---- Loss: InfoNCE with auxiliary MSE ----
+    # ---- Pure InfoNCE loss with hard negatives ----
     def compute_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
         event_data = self.dataset['events'][event_id]
         masked_role = event_data['roles'][role_slot_idx]
@@ -170,49 +173,44 @@ class GraphPEGModel(nn.Module):
         verb = event_data['event_type']
 
         context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
+        # Add noise to context (during training only) for robustness
+        if self.training:
+            noise = torch.randn_like(context) * self.config.noise_std
+            context = context + noise
+
         pred = self._predict_filler(context, role_name)   # (hidden_dim,)
         pos_emb = self._get_entity_embedding(target_entity_id)
 
-        # Hard negatives from same verb-role
+        # Hard negatives: same verb-role
         hard_pool = self.role_entity_map.get((verb, role_name), [])
         hard_neg_ids = [eid for eid in hard_pool if eid != target_entity_id]
-        # Random negatives
-        random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
-
-        # mix: half hard, half random
-        num_hard = self.config.num_negatives // 2
-        num_random = self.config.num_negatives - num_hard
-        if len(hard_neg_ids) > num_hard:
-            hard_neg_ids = random.sample(hard_neg_ids, num_hard)
+        if len(hard_neg_ids) > self.config.num_negatives:
+            hard_neg_ids = random.sample(hard_neg_ids, self.config.num_negatives)
+        elif len(hard_neg_ids) > 0:
+            # pad with random negatives if not enough hard
+            random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
+            if random_pool:
+                extra = random.sample(random_pool, min(self.config.num_negatives - len(hard_neg_ids), len(random_pool)))
+                hard_neg_ids.extend(extra)
         else:
-            num_random = self.config.num_negatives - len(hard_neg_ids)
-        if len(random_pool) > num_random:
-            random_neg_ids = random.sample(random_pool, num_random)
-        else:
-            random_neg_ids = random_pool
-        neg_ids = hard_neg_ids + random_neg_ids
-        if len(neg_ids) < 1:
-            neg_ids = random.sample([eid for eid in self.all_entity_ids if eid != target_entity_id],
-                                    min(self.config.num_negatives, len(self.all_entity_ids)-1))
+            # fallback: all random
+            random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id]
+            hard_neg_ids = random.sample(random_pool, min(self.config.num_negatives, len(random_pool)))
 
-        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])  # (K, hidden_dim)
+        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in hard_neg_ids])  # (K, hidden_dim)
 
-        # Compute logits: scaled cosine similarities
-        pred_norm = F.normalize(pred, dim=0)  # (hidden_dim)
+        # Normalize all embeddings
+        pred_norm = F.normalize(pred, dim=0)
         pos_norm = F.normalize(pos_emb, dim=0)
-        neg_norm = F.normalize(neg_embs, dim=1)  # (K, hidden_dim)
+        neg_norm = F.normalize(neg_embs, dim=1)
 
-        pos_sim = torch.dot(pred_norm, pos_norm)  # scalar
+        pos_sim = torch.dot(pred_norm, pos_norm)
         neg_sim = torch.mv(neg_norm, pred_norm)   # (K,)
 
         logits = torch.cat([pos_sim.unsqueeze(0), neg_sim]) * self.logit_scale.exp()
         labels = torch.zeros(1, dtype=torch.long, device=pred.device)
-        info_loss = F.cross_entropy(logits.unsqueeze(0), labels)
-
-        # Auxiliary MSE to force predictor to match positive
-        mse_loss = F.mse_loss(pred, pos_emb)
-
-        return info_loss + self.config.mse_weight * mse_loss
+        loss = F.cross_entropy(logits.unsqueeze(0), labels)
+        return loss
 
     # ---- Surprise ----
     def compute_role_surprise(self, event_id: int, role_slot_idx: int) -> float:
@@ -269,11 +267,11 @@ class GraphPEGModel(nn.Module):
 # --------------------------------------------------------------------
 # 3. TRAINING LOOP
 # --------------------------------------------------------------------
-def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
+def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=150):
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=model.config.lr,
                                  weight_decay=model.config.weight_decay)
-    scheduler = StepLR(optimizer, step_size=20, gamma=0.8)
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.7)
 
     events = dataset['events']
     maskable_slots = {}
@@ -296,6 +294,7 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
             slots = maskable_slots[eid]
             role_slot_idx = random.choice(slots)
 
+            model.train()
             loss = model.compute_loss(eid, role_slot_idx)
             optimizer.zero_grad()
             loss.backward()
@@ -304,7 +303,6 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
             total_loss += loss.item()
             n_steps += 1
 
-            # update occurrence counts
             event_type = events[eid]['event_type']
             idx = model.event_type_to_idx[event_type]
             model.event_occurrence_counts[idx] += 1
@@ -356,7 +354,7 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (fixed extraction)
+# 5. NOVELTY TEST (fixed)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     import spacy
@@ -389,7 +387,6 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
             surprises = {}
             for i, r in enumerate(roles):
-                # build context from other roles
                 context_vec = event_vec.clone()
                 for j, other in enumerate(roles):
                     if i == j:
@@ -462,7 +459,6 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     print("  Expected: Test 1 < 0.2 (known verb, new modifier should generalise).")
     print("            Test 2 > 0.2 (new verb, surprise should be moderate).")
     print("            Test 3 > 0.3 (completely new event – highest surprise).")
-    print("  Note: thresholds are approximate; improvement expected.")
 
 
 # --------------------------------------------------------------------
@@ -470,13 +466,13 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v7.1-buffer-fixed <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v8-pure-contrastive-noise <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
-    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 150
 
     with open(sys.argv[1], 'rb') as f:
         dataset = pickle.load(f)

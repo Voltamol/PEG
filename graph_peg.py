@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg.py — Graph‑PEG engine v10 (data augmentation for generalisation)
-# VERSION MARKER: v10-augmented-generalisation
+# graph_peg.py — Graph‑PEG engine v11 (no verb embedding, pure roles)
+# VERSION MARKER: v11-no-verb-embedding
 
 import torch
 import torch.nn as nn
@@ -20,7 +20,7 @@ class GraphPEGConfig:
         self.role_dim = 64
         self.lr = 5e-4
         self.weight_decay = 1e-5
-        self.epochs = 250
+        self.epochs = 200
         self.gamma = 0.995
         self.alpha = 0.1
         self.beta = 0.05
@@ -33,7 +33,7 @@ class GraphPEGConfig:
         self.dropout = 0.2
         self.temperature = 0.05
         self.noise_std = 0.05
-        self.augment_prob = 0.5   # probability to replace each context entity
+        self.augment_prob = 0.5
 
 
 # --------------------------------------------------------------------
@@ -56,7 +56,7 @@ class GraphPEGModel(nn.Module):
         self.event_type_to_idx = dict(dataset['event_types'])
         self.num_event_types = len(self.event_type_to_idx)
 
-        # embeddings
+        # embeddings – event embeddings are still kept for compatibility but NOT used in context
         self.event_embeddings = nn.Parameter(
             torch.randn(self.num_event_types, config.hidden_dim) * 0.01
         )
@@ -110,7 +110,7 @@ class GraphPEGModel(nn.Module):
 
     def _build_role_entity_map(self):
         self.role_entity_map = {}
-        self.role_to_entities = {}   # role -> list of entity ids (global)
+        self.role_to_entities = {}
         for event in self.dataset['events']:
             verb = event['event_type']
             for role_info in event['roles']:
@@ -130,10 +130,6 @@ class GraphPEGModel(nn.Module):
         for role in self.role_to_entities:
             self.role_to_entities[role] = list(set(self.role_to_entities[role]))
 
-    def _get_event_type_embedding(self, event_type: str) -> torch.Tensor:
-        idx = self.event_type_to_idx[event_type]
-        return self.event_embeddings[idx]
-
     def _get_role_embedding(self, role_name: str) -> torch.Tensor:
         idx = self.role_to_idx[role_name]
         return self.role_embeddings[idx]
@@ -146,10 +142,9 @@ class GraphPEGModel(nn.Module):
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None,
                          augment: bool = False) -> torch.Tensor:
         """
-        Build context vector. If augment=True, replace some context entities
-        with random entities from the same role (but not from this event).
+        Build context from ONLY role-entity products – NO verb embedding.
         """
-        vec = self._get_event_type_embedding(event_data['event_type']).clone()
+        vec = torch.zeros(self.config.hidden_dim, device=self.event_embeddings.device)
         for i, role_info in enumerate(event_data['roles']):
             if i == exclude_role_slot:
                 continue
@@ -157,7 +152,6 @@ class GraphPEGModel(nn.Module):
                 continue
             role = role_info['role']
             original_eid = role_info['entity_id']
-            # Augmentation: replace with another entity of the same role?
             if augment and random.random() < self.config.augment_prob:
                 candidates = [eid for eid in self.role_to_entities.get(role, []) if eid != original_eid]
                 if candidates:
@@ -176,9 +170,8 @@ class GraphPEGModel(nn.Module):
         masked_role = event_data['roles'][role_slot_idx]
         role_name = masked_role['role']
         target_entity_id = masked_role['entity_id']
-        verb = event_data['event_type']
+        verb = event_data['event_type']   # only for hard negative selection
 
-        # Build context with augmentation (if training)
         context = self._compose_context(event_data, exclude_role_slot=role_slot_idx,
                                         augment=self.training)
         if self.training:
@@ -188,13 +181,12 @@ class GraphPEGModel(nn.Module):
         pred = self._predict_filler(context, role_name)   # (hidden_dim,)
         pos_emb = self._get_entity_embedding(target_entity_id)
 
-        # Hard negatives: same verb-role
+        # Hard negatives: same verb-role (still use verb-role mapping)
         hard_pool = self.role_entity_map.get((verb, role_name), [])
         hard_neg_ids = [eid for eid in hard_pool if eid != target_entity_id]
         if len(hard_neg_ids) > self.config.num_negatives:
             hard_neg_ids = random.sample(hard_neg_ids, self.config.num_negatives)
         elif len(hard_neg_ids) > 0:
-            # pad with random negatives
             random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
             if random_pool:
                 extra = random.sample(random_pool, min(self.config.num_negatives - len(hard_neg_ids), len(random_pool)))
@@ -203,7 +195,7 @@ class GraphPEGModel(nn.Module):
             random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id]
             hard_neg_ids = random.sample(random_pool, min(self.config.num_negatives, len(random_pool)))
 
-        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in hard_neg_ids])  # (K, hidden_dim)
+        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in hard_neg_ids])
 
         # Normalize
         pred_norm = F.normalize(pred, dim=0)
@@ -211,7 +203,7 @@ class GraphPEGModel(nn.Module):
         neg_norm = F.normalize(neg_embs, dim=1)
 
         pos_sim = torch.dot(pred_norm, pos_norm)
-        neg_sim = torch.mv(neg_norm, pred_norm)   # (K,)
+        neg_sim = torch.mv(neg_norm, pred_norm)
 
         logits = torch.cat([pos_sim.unsqueeze(0), neg_sim]) / self.config.temperature
         labels = torch.zeros(1, dtype=torch.long, device=pred.device)
@@ -273,7 +265,7 @@ class GraphPEGModel(nn.Module):
 # --------------------------------------------------------------------
 # 3. TRAINING LOOP
 # --------------------------------------------------------------------
-def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=250):
+def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=200):
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=model.config.lr,
                                  weight_decay=model.config.weight_decay)
@@ -375,11 +367,10 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
     def compute_surprise_for_new_event(event_type: str, roles: List[Dict]):
         with torch.no_grad():
+            # Note: verb embedding is NOT used in context, but we need it for status
             if event_type in model.event_type_to_idx:
-                event_vec = model._get_event_type_embedding(event_type)
                 verb_status = "KNOWN"
             else:
-                event_vec = model.event_embeddings.mean(dim=0)
                 verb_status = "NEW (using average)"
             print(f"  Verb: '{event_type}' [{verb_status}]")
 
@@ -393,7 +384,8 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
             surprises = {}
             for i, r in enumerate(roles):
-                context_vec = event_vec.clone()
+                # Build context from other roles ONLY (no verb embedding)
+                context_vec = torch.zeros(model.config.hidden_dim, device=model.event_embeddings.device)
                 for j, other in enumerate(roles):
                     if i == j:
                         continue
@@ -465,6 +457,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     print("  Expected: Test 1 < 0.2 (known verb, new modifier should generalise).")
     print("            Test 2 > 0.2 (new verb, surprise should be moderate).")
     print("            Test 3 > 0.3 (completely new event – highest surprise).")
+    print("  This version removes the verb embedding from context to force role-based generalisation.")
 
 
 # --------------------------------------------------------------------
@@ -472,13 +465,13 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v10-augmented-generalisation <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v11-no-verb-embedding <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
-    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 250
+    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 200
 
     with open(sys.argv[1], 'rb') as f:
         dataset = pickle.load(f)

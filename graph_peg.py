@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # graph_peg.py — The Graph‑PEG engine.
-# VERSION MARKER: v3-fix-entity-projection-dim-mismatch
+# VERSION MARKER: v4-contrastive-loss-fixed-appos
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ from typing import List, Dict, Optional, Any
 # --------------------------------------------------------------------
 class GraphPEGConfig:
     def __init__(self):
-        self.hidden_dim = 256
+        self.hidden_dim = 384          # Increased for better capacity
         self.role_dim = 64
         self.lr = 1e-3
         self.epochs = 30
@@ -26,6 +26,8 @@ class GraphPEGConfig:
         self.min_occurrences = 3
         self.merge_threshold = 0.95
         self.mask_prob = 0.15
+        self.temperature = 0.1          # NEW: for contrastive loss
+        self.num_negatives = 5          # NEW: number of negative samples per mask
 
 
 # --------------------------------------------------------------------
@@ -82,6 +84,8 @@ class GraphPEGModel(nn.Module):
 
         sorted_ids = sorted(self.dataset['entities'].keys())
         self._entity_id_to_row = {eid: i for i, eid in enumerate(sorted_ids)}
+        # NEW: list of all entity IDs for negative sampling
+        self.all_entity_ids = list(self.dataset['entities'].keys())
 
         self.to('cpu')
 
@@ -131,7 +135,34 @@ class GraphPEGModel(nn.Module):
         combined = torch.cat([context_vec, role_emb], dim=-1)
         return self.predictor(combined)
 
-    def compute_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
+    # NEW: Contrastive loss for a single masked slot
+    def compute_contrastive_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
+        event_data = self.dataset['events'][event_id]
+        masked_role = event_data['roles'][role_slot_idx]
+        role_name = masked_role['role']
+        target_entity_id = masked_role['entity_id']
+
+        context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
+        pred_emb = self._predict_filler(context, role_name)   # (hidden_dim,)
+
+        pos_emb = self._get_entity_embedding(target_entity_id)  # (hidden_dim,)
+
+        # Sample negative entities (distinct from positive)
+        neg_candidates = [eid for eid in self.all_entity_ids if eid != target_entity_id]
+        neg_ids = random.sample(neg_candidates, min(self.config.num_negatives, len(neg_candidates)))
+        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])  # (K, hidden_dim)
+
+        # Compute cosine similarities
+        sim_pos = F.cosine_similarity(pred_emb.unsqueeze(0), pos_emb.unsqueeze(0))  # (1,)
+        sim_neg = F.cosine_similarity(pred_emb.unsqueeze(0), neg_embs)             # (K,)
+
+        logits = torch.cat([sim_pos, sim_neg]) / self.config.temperature  # (K+1,)
+        labels = torch.zeros(1, dtype=torch.long, device=pred_emb.device)  # positive index = 0
+        loss = F.cross_entropy(logits.unsqueeze(0), labels)
+        return loss
+
+    # Old MSE loss kept for reference (not used in training)
+    def compute_mse_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
         event_data = self.dataset['events'][event_id]
         masked_role_info = event_data['roles'][role_slot_idx]
         role_name = masked_role_info['role']
@@ -164,7 +195,7 @@ class GraphPEGModel(nn.Module):
     def compose_full_event(self, event_data: Dict) -> torch.Tensor:
         return self._compose_context(event_data, exclude_role_slot=None)
 
-    # ---- Energy System ----
+    # ---- Energy System (unchanged) ----
     def update_energy(self, event_ids: List[int]):
         self.entity_energies *= self.config.gamma
         touched = set()
@@ -194,8 +225,9 @@ class GraphPEGModel(nn.Module):
             eid = row_to_id[row]
             self.active_entity_ids.discard(eid)
 
+
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP (unchanged)
+# 3. TRAINING LOOP (UPDATED with contrastive loss)
 # --------------------------------------------------------------------
 def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
     optimizer = torch.optim.Adam(model.parameters(), lr=model.config.lr)
@@ -221,12 +253,15 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
 
         for eid in trainable_event_ids:
             slots = maskable_slots[eid]
+            # FIX: Mask multiple roles per event (we'll randomly choose one per forward pass,
+            # but we could also loop over all slots; for simplicity we keep one per step)
             role_slot_idx = random.choice(slots)
 
             if len(slots) == 1 and not skipped_single_role_note_shown:
                 skipped_single_role_note_shown = True
 
-            loss = model.compute_loss(eid, role_slot_idx)
+            # NEW: Use contrastive loss instead of MSE
+            loss = model.compute_contrastive_loss(eid, role_slot_idx)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -234,6 +269,7 @@ def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=30):
             total_loss += loss.item()
             n_steps += 1
 
+            # Update occurrence counts (for spawning logic)
             event_type = events[eid]['event_type']
             idx = model.event_type_to_idx[event_type]
             model.event_occurrence_counts[idx] += 1
@@ -284,7 +320,7 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST
+# 5. NOVELTY TEST (fixed appos extraction)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     """
@@ -369,7 +405,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for role, val in surprises2.items():
         print(f"    {role}: surprise={val:.4f}")
 
-        # --- Test 3: NEW verb + NEW entities (fixed appos extraction) ---
+    # --- Test 3: NEW verb + NEW entities (FIXED appos extraction) ---
     print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
     new_sentence3 = "Zorp the alien arrived."
     doc3 = nlp(new_sentence3)
@@ -377,26 +413,30 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     event_type3 = root3.lemma_
     roles3 = []
 
-    subj_token = None
+    # Find the nsubj child of the root
+    subj = None
     for child in root3.children:
         if child.dep_ == 'nsubj':
-            subj_token = child
-            roles3.append({'role': 'AGENT', 'entity_text': child.text})
-        elif child.dep_ == 'det':
-            pass  # ignore "the"
-        # Note: appos is usually NOT a child of the verb root in spaCy,
-        # it's a child of the noun it modifies.
+            subj = child
+            break
 
-    # Now check the subject's children for appositive
-    if subj_token:
-        for child in subj_token.children:
+    if subj:
+        # AGENT is the head noun (the subj itself)
+        roles3.append({'role': 'AGENT', 'entity_text': subj.text})
+        # Look for appos modifiers attached to this subj
+        for child in subj.children:
             if child.dep_ == 'appos':
                 roles3.append({'role': 'MODIFIER', 'entity_text': child.text})
-
-    # Fallback: if still no MODIFIER, scan the doc for any appos attached to nsubj
-    if not any(r['role'] == 'MODIFIER' for r in roles3):
+                break
+        else:  # fallback: scan entire doc for appos whose head is the subj
+            for token in doc3:
+                if token.dep_ == 'appos' and token.head == subj:
+                    roles3.append({'role': 'MODIFIER', 'entity_text': token.text})
+                    break
+    else:
+        # Fallback: if no subject found, try to find any appos as modifier (unlikely)
         for token in doc3:
-            if token.dep_ == 'appos' and token.head.dep_ == 'nsubj':
+            if token.dep_ == 'appos':
                 roles3.append({'role': 'MODIFIER', 'entity_text': token.text})
                 break
 
@@ -405,7 +445,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     surprises3, status3 = compute_surprise_for_new_event(event_type3, roles3)
     for role, val in surprises3.items():
         print(f"    {role}: surprise={val:.4f}")
-        
+
     # --- Interpretation ---
     print("\n--- Interpretation ---")
     print(f"  Test 1 (carpenter): MODIFIER surprise = {surprises1.get('MODIFIER', 0.0):.4f}")
@@ -416,12 +456,14 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     print("  Expected: Test 1 < 0.1 (known verb, new modifier should generalise).")
     print("            Test 2 > 0.2 (new verb, surprise should be moderate).")
     print("            Test 3 > 0.3 (completely new event – highest surprise).")
+
+
 # --------------------------------------------------------------------
-# 5. MAIN
+# 6. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v3-fix-entity-projection-dim-mismatch <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v4-contrastive-loss-fixed-appos <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg.py <graph_corpus.pkl> [epochs]")
@@ -440,6 +482,4 @@ if __name__ == "__main__":
 
     train_graph_peg(model, dataset, epochs=epochs)
     run_sanity_checks(model, dataset)
-    
-    # Run the novelty test
     test_novelty(model, dataset)

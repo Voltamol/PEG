@@ -451,6 +451,8 @@ if __name__ == "__main__":
         "The cat that chased the mouse is black.",
         "She gave him a book.",
     ]
+    from story_corpus import story_corpus
+    corpus=story_corpus
 
     output = preprocess(corpus, output_file='demo_graph_corpus.pkl', debug=args.debug)
     ok = run_self_checks(output)

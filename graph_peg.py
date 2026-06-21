@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg_v16.py — Linear predictor + InfoNCE cosine similarity
-# VERSION MARKER: v16-linear-infonce
+# graph_peg_v17.py — MLP predictor + InfoNCE, tuned for large corpus
+# VERSION MARKER: v17-mlp-infonce-tuned
 
 import torch
 import torch.nn as nn
@@ -18,15 +18,15 @@ class GraphPEGConfig:
     def __init__(self):
         self.hidden_dim = 256
         self.role_dim = 64
-        self.lr = 1e-4
-        self.weight_decay = 1e-5
-        self.epochs = 100
-        self.dropout = 0.1
+        self.lr = 5e-5                    # lower LR for stability
+        self.weight_decay = 1e-4          # stronger regularization
+        self.epochs = 150
+        self.dropout = 0.2
         self.noise_std = 0.05
         self.batch_size = 32
         self.verb_weight = 0.2
-        self.temperature = 0.1
-        self.num_negatives = 10
+        self.temperature = 0.05           # sharper
+        self.num_negatives = 15           # more negatives
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -59,8 +59,17 @@ class GraphPEGModel(nn.Module):
         )
         self.role_proj = nn.Linear(config.role_dim, config.hidden_dim)
 
-        # Linear predictor: context+role -> hidden_dim
-        self.predictor = nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim)
+        # MLP predictor: 2 layers with residual connection
+        self.predictor = nn.Sequential(
+            nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+        )
+        # Final linear projection to hidden_dim (no activation)
+        self.final_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
 
         # entity projection
         sample_ent = next(iter(self.dataset['entities'].values()))
@@ -142,7 +151,8 @@ class GraphPEGModel(nn.Module):
     def _predict_filler(self, context_vec: torch.Tensor, role: str) -> torch.Tensor:
         role_emb = self._get_role_embedding(role)
         combined = torch.cat([context_vec, role_emb], dim=-1)
-        return self.predictor(combined)   # (hidden_dim,)
+        hidden = self.predictor(combined)         # (hidden_dim,)
+        return self.final_proj(hidden)            # (hidden_dim,)
 
     def compute_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
         event_data = self.dataset['events'][event_id]
@@ -159,7 +169,7 @@ class GraphPEGModel(nn.Module):
         pred = self._predict_filler(context, role_name)   # (hidden_dim,)
         pos_emb = self._get_entity_embedding(target_entity_id)
 
-        # Negatives: mix of hard and random
+        # Mix of hard and random negatives
         hard_pool = self.role_entity_map.get((verb, role_name), [])
         hard_neg_ids = [eid for eid in hard_pool if eid != target_entity_id]
         random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
@@ -185,7 +195,6 @@ class GraphPEGModel(nn.Module):
 
         neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])  # (K, hidden_dim)
 
-        # Normalize all vectors
         pred_norm = F.normalize(pred, dim=0)
         pos_norm = F.normalize(pos_emb, dim=0)
         neg_norm = F.normalize(neg_embs, dim=1)
@@ -222,11 +231,11 @@ class GraphPEGModel(nn.Module):
 # --------------------------------------------------------------------
 # 3. TRAINING LOOP (same as before)
 # --------------------------------------------------------------------
-def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
+def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=150):
     optimizer = torch.optim.Adam(model.parameters(),
                                  lr=model.config.lr,
                                  weight_decay=model.config.weight_decay)
-    scheduler = StepLR(optimizer, step_size=20, gamma=0.8)
+    scheduler = StepLR(optimizer, step_size=30, gamma=0.7)   # slower decay
 
     events = dataset['events']
     maskable_slots = {}
@@ -304,7 +313,7 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (adapted)
+# 5. NOVELTY TEST (unchanged)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     import spacy
@@ -417,13 +426,13 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v16-linear-infonce <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v17-mlp-infonce-tuned <<<")
 
     if len(sys.argv) < 2:
-        print("Usage: python3 graph_peg_v16.py <graph_corpus.pkl> [epochs]")
+        print("Usage: python3 graph_peg_v17.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
-    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 150
 
     with open(sys.argv[1], 'rb') as f:
         dataset = pickle.load(f)

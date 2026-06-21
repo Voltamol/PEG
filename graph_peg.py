@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # graph_peg_v17.py — MLP predictor + InfoNCE, tuned for large corpus
-# VERSION MARKER: v17-mlp-infonce-tuned
+# VERSION MARKER: v18-fix-context-role-magnitude-imbalance
 
 import torch
 import torch.nn as nn
@@ -149,8 +149,31 @@ class GraphPEGModel(nn.Module):
         return self.config.verb_weight * verb_emb + (1 - self.config.verb_weight) * role_sum
 
     def _predict_filler(self, context_vec: torch.Tensor, role: str) -> torch.Tensor:
+        # CONFIRMED BUG, found via layer-by-layer cosine-similarity
+        # tracing on real corpus scale: context_vec's norm at
+        # initialization (~0.035) is roughly 3x smaller than
+        # role_embeddings' norm (~0.10), since both are scaled by *0.01
+        # but role_sum involves fewer/smaller terms after the verb_weight
+        # mixing. Going into the first Linear layer of `predictor`, this
+        # imbalance means the layer's output is dominated almost entirely
+        # by WHICH ROLE is being predicted, not by the actual event
+        # context — confirmed empirically: two completely unrelated
+        # events produced predictor outputs with 0.999 cosine similarity,
+        # both before AND after training (it got worse after training,
+        # 0.9989 -> 0.9999, meaning gradient descent was reinforcing the
+        # collapse rather than fixing it). This explains the flat,
+        # undifferentiated surprise scores in the novelty test (0.8-0.93
+        # for both "easy known" and "completely novel" cases — the
+        # predictor's output barely depends on context at all).
+        #
+        # Fix: normalize context_vec to unit norm (matching role_emb's
+        # already-comparable scale) before concatenation, so the first
+        # Linear layer receives two terms of comparable magnitude and
+        # has to actually use both, rather than the larger term
+        # dominating by initialization accident.
+        context_normed = F.normalize(context_vec, dim=0, eps=1e-8)
         role_emb = self._get_role_embedding(role)
-        combined = torch.cat([context_vec, role_emb], dim=-1)
+        combined = torch.cat([context_normed, role_emb], dim=-1)
         hidden = self.predictor(combined)         # (hidden_dim,)
         return self.final_proj(hidden)            # (hidden_dim,)
 
@@ -426,7 +449,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v17-mlp-infonce-tuned <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v18-fix-context-role-magnitude-imbalance <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg_v17.py <graph_corpus.pkl> [epochs]")

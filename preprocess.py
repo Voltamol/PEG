@@ -260,8 +260,53 @@ def find_predicate_tokens(doc):
     return predicates
 
 
+
+# CONFIRMED BUG, found via real corpus run on Alice in Wonderland:
+# spaCy's lemmatizer does not reliably normalize informal contractions
+# to their base verb. "'s", "'m", "'re", "'ve", "'d", archaic "doth",
+# "tis" all surfaced as DISTINCT event_type values from "be"/"have"/
+# "do" in the dataset, fragmenting what should be one verb's worth of
+# training signal across half a dozen near-empty pseudo-verbs. Example
+# from the dump: events [101], [149], [151], [490] all use "'s"/"'m"/
+# "'re" as the event_type where "be" was clearly intended.
+CONTRACTION_LEMMA_MAP = {
+    "'s": 'be', "’s": 'be',
+    "'m": 'be', "’m": 'be',
+    "'re": 'be', "’re": 'be',
+    "'ve": 'have', "’ve": 'have',
+    "'d": 'have', "’d": 'have',  # ambiguous (had/would) but 'have' is the more common source
+    'tis': 'be', "'tis": 'be',
+    'twas': 'be', "'twas": 'be',
+    'doth': 'do', 'dost': 'do',
+    'hath': 'have',
+}
+
+# Bare modal auxiliaries (can/could/will/would/must/should/shall/might)
+# that occasionally get parsed as the ROOT/main predicate of a clause
+# (e.g. elliptical "Can you?" or parser quirks on archaic/odd syntax)
+# rather than attaching as `aux` to a content verb. These carry almost
+# no independent role-filler semantics of their own — "could: AGENT=I"
+# tells the model nothing useful and just adds vocabulary noise. Filter
+# them out entirely rather than try to merge them into something, since
+# there's no single verb they should collapse into.
+BARE_MODAL_LEMMAS = {
+    'can', 'could', 'will', 'would', 'must', 'should', 'shall', 'might', 'may',
+}
+
+
+def normalize_event_type(raw_lemma: str) -> Optional[str]:
+    """Returns the normalized verb lemma, or None if this predicate
+    should be dropped entirely (bare modal)."""
+    lemma_lower = raw_lemma.lower()
+    if lemma_lower in BARE_MODAL_LEMMAS:
+        return None
+    return CONTRACTION_LEMMA_MAP.get(lemma_lower, lemma_lower)
+
+
 def extract_event_for_predicate(pred_token, sent_idx, doc):
-    event_type = pred_token.lemma_
+    event_type = normalize_event_type(pred_token.lemma_)
+    if event_type is None:
+        return None  # bare modal — caller must skip this predicate entirely
     roles = []
 
     for child in pred_token.children:
@@ -413,6 +458,8 @@ def extract_events(doc, sent_idx):
     events = []
     for pred in predicates:
         ev = extract_event_for_predicate(pred, sent_idx, doc)
+        if ev is None:
+            continue  # bare modal (can/could/will/...), filtered intentionally
         if ev['roles']:  # skip predicates that yielded nothing (e.g. bare aux)
             events.append(ev)
         else:
@@ -597,7 +644,7 @@ def dump_events(output):
 
 if __name__ == "__main__":
     
-    print(">>> RUNNING preprocess.py VERSION: v7-ambiguous-preposition-disambiguation <<<")
+    print(">>> RUNNING preprocess.py VERSION: v8-contraction-and-modal-verb-normalization <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')
@@ -629,4 +676,3 @@ if __name__ == "__main__":
     ok = run_self_checks(output, is_demo_corpus=is_demo)
     dump_events(output)
     sys.exit(0 if ok else 1)
-

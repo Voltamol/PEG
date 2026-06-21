@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# graph_peg_v15.py — Bilinear scoring with margin ranking loss
-# VERSION MARKER: v15-bilinear-ranking
+# graph_peg_v16.py — Linear predictor + InfoNCE cosine similarity
+# VERSION MARKER: v16-linear-infonce
 
 import torch
 import torch.nn as nn
@@ -25,13 +25,13 @@ class GraphPEGConfig:
         self.noise_std = 0.05
         self.batch_size = 32
         self.verb_weight = 0.2
-        self.margin = 0.5                # margin for ranking loss
-        self.num_negatives = 10           # negatives per positive
+        self.temperature = 0.1
+        self.num_negatives = 10
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # --------------------------------------------------------------------
-# 2. MODEL (Bilinear)
+# 2. MODEL
 # --------------------------------------------------------------------
 class GraphPEGModel(nn.Module):
     def __init__(self, config: GraphPEGConfig, dataset: Dict[str, Any]):
@@ -59,11 +59,8 @@ class GraphPEGModel(nn.Module):
         )
         self.role_proj = nn.Linear(config.role_dim, config.hidden_dim)
 
-        # Bilinear weights per role (diagonal matrix)
-        # We'll use a vector of length hidden_dim per role, representing the diagonal.
-        self.role_bilinear = nn.Parameter(
-            torch.randn(self.num_roles, config.hidden_dim) * 0.01
-        )
+        # Linear predictor: context+role -> hidden_dim
+        self.predictor = nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim)
 
         # entity projection
         sample_ent = next(iter(self.dataset['entities'].values()))
@@ -128,9 +125,7 @@ class GraphPEGModel(nn.Module):
         return self.entity_embeddings[row]
 
     def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
-        # Verb embedding (weak cue)
         verb_emb = self._get_event_type_embedding(event_data['event_type'])
-        # Sum of role*entity for all other roles
         role_sum = torch.zeros(self.config.hidden_dim, device=self.config.device)
         for i, role_info in enumerate(event_data['roles']):
             if i == exclude_role_slot:
@@ -142,14 +137,12 @@ class GraphPEGModel(nn.Module):
             role_emb = self.role_proj(self._get_role_embedding(role))
             entity_emb = self._get_entity_embedding(entity_id)
             role_sum = role_sum + role_emb * entity_emb
-        # Combine: weak verb + strong role sum
         return self.config.verb_weight * verb_emb + (1 - self.config.verb_weight) * role_sum
 
-    def _score(self, context: torch.Tensor, role: str, entity_emb: torch.Tensor) -> torch.Tensor:
-        # Bilinear score: context^T * diag(w_role) * entity_emb = sum(context * w_role * entity_emb)
-        role_idx = self.role_to_idx[role]
-        w = self.role_bilinear[role_idx]          # (hidden_dim,)
-        return torch.sum(context * w * entity_emb, dim=-1)
+    def _predict_filler(self, context_vec: torch.Tensor, role: str) -> torch.Tensor:
+        role_emb = self._get_role_embedding(role)
+        combined = torch.cat([context_vec, role_emb], dim=-1)
+        return self.predictor(combined)   # (hidden_dim,)
 
     def compute_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
         event_data = self.dataset['events'][event_id]
@@ -163,10 +156,10 @@ class GraphPEGModel(nn.Module):
             noise = torch.randn_like(context) * self.config.noise_std
             context = context + noise
 
+        pred = self._predict_filler(context, role_name)   # (hidden_dim,)
         pos_emb = self._get_entity_embedding(target_entity_id)
-        pos_score = self._score(context, role_name, pos_emb)
 
-        # Negatives: hard negatives from same verb-role, plus random
+        # Negatives: mix of hard and random
         hard_pool = self.role_entity_map.get((verb, role_name), [])
         hard_neg_ids = [eid for eid in hard_pool if eid != target_entity_id]
         random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
@@ -187,15 +180,22 @@ class GraphPEGModel(nn.Module):
 
         neg_ids = sampled_hard + sampled_random
         if len(neg_ids) < 1:
-            # fallback
             neg_ids = random.sample([eid for eid in self.all_entity_ids if eid != target_entity_id],
                                     min(self.config.num_negatives, len(self.all_entity_ids)-1))
 
-        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])
-        neg_scores = self._score(context, role_name, neg_embs)  # (K,)
+        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])  # (K, hidden_dim)
 
-        # Margin ranking loss: max(0, margin + neg_score - pos_score)
-        loss = torch.mean(F.relu(self.config.margin + neg_scores - pos_score.unsqueeze(0)))
+        # Normalize all vectors
+        pred_norm = F.normalize(pred, dim=0)
+        pos_norm = F.normalize(pos_emb, dim=0)
+        neg_norm = F.normalize(neg_embs, dim=1)
+
+        pos_sim = torch.dot(pred_norm, pos_norm)
+        neg_sim = torch.mv(neg_norm, pred_norm)   # (K,)
+
+        logits = torch.cat([pos_sim.unsqueeze(0), neg_sim]) / self.config.temperature
+        labels = torch.zeros(1, dtype=torch.long, device=pred.device)
+        loss = F.cross_entropy(logits.unsqueeze(0), labels)
         return loss
 
     # ---- Surprise ----
@@ -205,14 +205,10 @@ class GraphPEGModel(nn.Module):
         if role_info['entity_id'] is None:
             return 0.0
         context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
+        pred = self._predict_filler(context, role_info['role'])
         target = self._get_entity_embedding(role_info['entity_id'])
-        # We use the score as a proxy for how well the model "knows" the filler.
-        # Higher score => lower surprise. We normalise by max possible score? We'll use 1 - sigmoid(score) as surprise.
-        score = self._score(context, role_info['role'], target)
-        # Convert to surprise in [0,1] using sigmoid (score typically small, sigmoid gives probability)
-        prob = torch.sigmoid(score)
-        surprise = 1 - prob.item()
-        return surprise
+        sim = F.cosine_similarity(pred.unsqueeze(0), target.unsqueeze(0)).item()
+        return 1 - sim
 
     def get_event_surprises(self, event_id: int) -> Dict[int, float]:
         event_data = self.dataset['events'][event_id]
@@ -224,7 +220,7 @@ class GraphPEGModel(nn.Module):
 
 
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP (similar to previous)
+# 3. TRAINING LOOP (same as before)
 # --------------------------------------------------------------------
 def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=100):
     optimizer = torch.optim.Adam(model.parameters(),
@@ -308,7 +304,7 @@ def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (adapted for bilinear)
+# 5. NOVELTY TEST (adapted)
 # --------------------------------------------------------------------
 def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     import spacy
@@ -341,7 +337,6 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
             surprises = {}
             for i, r in enumerate(roles):
-                # Build context
                 role_sum = torch.zeros(model.config.hidden_dim, device=model.config.device)
                 for j, other in enumerate(roles):
                     if i == j:
@@ -351,15 +346,15 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
                     role_sum = role_sum + role_emb * entity_emb
                 context_vec = model.config.verb_weight * verb_vec + (1 - model.config.verb_weight) * role_sum
 
+                pred = model._predict_filler(context_vec, r['role'])
                 target = entity_projs[r['entity_text']]
-                score = model._score(context_vec, r['role'], target)
-                prob = torch.sigmoid(score)
-                surprise = 1 - prob.item()
+                sim = F.cosine_similarity(pred.unsqueeze(0), target.unsqueeze(0)).item()
+                surprise = 1 - sim
                 surprises[r['role']] = surprise
 
             return surprises, verb_status
 
-    # --- Test 1: Known verb + new modifier ---
+    # --- Test 1 ---
     print("\n--- Test 1: Known verb 'be' + NEW modifier 'carpenter' ---")
     new_sentence1 = "Leo was a carpenter."
     doc1 = nlp(new_sentence1)
@@ -376,7 +371,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for role, val in surprises1.items():
         print(f"    {role}: surprise={val:.4f}")
 
-    # --- Test 2: New verb + known filler ---
+    # --- Test 2 ---
     print("\n--- Test 2: NEW verb 'dance' + known filler 'John' ---")
     new_sentence2 = "John danced."
     doc2 = nlp(new_sentence2)
@@ -391,7 +386,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     for role, val in surprises2.items():
         print(f"    {role}: surprise={val:.4f}")
 
-    # --- Test 3: NEW verb + NEW entities (manual) ---
+    # --- Test 3 ---
     print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
     new_sentence3 = "Zorp the alien arrived."
     event_type3 = "arrive"
@@ -422,10 +417,10 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v15-bilinear-ranking <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v16-linear-infonce <<<")
 
     if len(sys.argv) < 2:
-        print("Usage: python3 graph_peg_v15.py <graph_corpus.pkl> [epochs]")
+        print("Usage: python3 graph_peg_v16.py <graph_corpus.pkl> [epochs]")
         sys.exit(1)
 
     epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 100

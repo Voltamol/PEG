@@ -494,3 +494,27 @@ if __name__ == "__main__":
     train_graph_peg(model, dataset, epochs=epochs)
     run_sanity_checks(model, dataset)
     test_novelty(model, dataset)
+    #-----------------------------
+    import torch
+
+    # After training, with the model in eval mode
+    model.eval()
+    with torch.no_grad():
+        preds = []
+        for event_id in range(50):  # sample of real training events
+            event_data = dataset['events'][event_id]
+            if not event_data['roles']:
+                continue
+            slot = 0
+            role = event_data['roles'][slot]['role']
+            context = model._compose_context(event_data, exclude_role_slot=slot)
+            pred = model._predict_filler(context, role)
+            preds.append(pred)
+
+        preds = torch.stack(preds)
+        preds_norm = torch.nn.functional.normalize(preds, dim=1)
+        sim_matrix = preds_norm @ preds_norm.T
+        n = sim_matrix.shape[0]
+        off_diag_mean = (sim_matrix.sum() - n) / (n * n - n)
+        print(f"Mean pairwise cosine similarity across {n} DIFFERENT events' predictions: {off_diag_mean:.4f}")
+        print(f"Prediction vector norm (mean): {preds.norm(dim=1).mean():.4f}, std: {preds.norm(dim=1).std():.4f}")

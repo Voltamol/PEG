@@ -1,10 +1,33 @@
 #!/usr/bin/env python3
 # preprocess.py — Generate the Graph-PEG dataset from raw text.
 #
-# VERSION MARKER: v4-location-prep-fix
-# (If the printed output when you run this doesn't show "v4-location-prep-fix"
-#  at the top, you are running a stale/different copy of this file — check
-#  for duplicate files in your working directory.)
+# VERSION MARKER: v9-attribute-role-and-motion-preps
+# (If the printed output when you run this doesn't show
+#  "v9-attribute-role-and-motion-preps" at the top, you are running a
+#  stale/different copy of this file — check for duplicate files in your
+#  working directory.)
+#
+# v9 CHANGE LOG (diagnosed from real clustering output on alice_graph.pkl —
+# avg_sim was 0.25-0.27 for MODIFIER/LOCATION pairs vs 0.7-1.0 for AGENT/
+# PATIENT pairs, and overall role-count audit showed MODIFIER+MANNER were
+# ~37% of all role-fillers combined, far above what a real adjunct rate
+# should be):
+#   1. NEW ROLE: 'ATTRIBUTE'. Copula complements (attr/acomp — "the door
+#      IS GREEN", "she FELT DIZZY") were previously hardcoded to MODIFIER
+#      (see old comment at that branch, now updated). These are a distinct
+#      semantic role — a predicated property of the AGENT/subject, not an
+#      adjunct modifying the verb — and were polluting the MODIFIER bucket
+#      with non-modifier fillers like "dear", "severity", "course".
+#   2. LOCATION_PREPS expanded to include motion/path prepositions (down,
+#      up, along, across, past, off, out, around, toward, towards).
+#      CONFIRMED BUG: map_prep_role()'s fallback ('return MODIFIER' for any
+#      preposition not in TIME_PREPS/LOCATION_PREPS) was silently catching
+#      every motion preposition we hadn't enumerated — "went DOWN the
+#      tunnel", "blew THROUGH the chimney" — and filing real locations
+#      under MODIFIER. This was the dominant source of MODIFIER's inflated
+#      count, not parser uncertainty (confidence was 1.0 on every one of
+#      these — the code was confidently doing the wrong thing, not
+#      hedging).
 #
 # IMPORTANT — READ BEFORE TRUSTING THIS FILE:
 # I do not have a working spaCy install in my execution sandbox (no network
@@ -164,7 +187,17 @@ DEP_TO_ROLE = {
 
 LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind',
                    'to', 'into', 'from', 'through', 'inside', 'outside',
-                   'beneath', 'beside', 'within', 'above', 'below'}
+                   'beneath', 'beside', 'within', 'above', 'below',
+                   # v9 addition: motion/path prepositions. These were
+                   # previously absent from both LOCATION_PREPS and
+                   # TIME_PREPS, so map_prep_role() fell through to its
+                   # 'return MODIFIER' default for every one of them —
+                   # e.g. "went DOWN the tunnel", "fell OUT OF the jar".
+                   # A path is still a LOCATION-type role for this
+                   # taxonomy (no separate PATH role exists yet); flag
+                   # this comment if you want PATH split out later.
+                   'down', 'up', 'along', 'across', 'past', 'off',
+                   'out', 'around', 'toward', 'towards'}
 TIME_PREPS = {'at', 'on', 'in', 'during', 'after', 'before', 'since', 'until'}
 
 # Words that, as the OBJECT of an ambiguous preposition (in/on/at — all
@@ -331,11 +364,17 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             roles.append({'role': 'RECIPIENT', 'entity_text': filler.text,
                           'is_pronoun': filler.text.lower() in PRONOUNS})
         elif dep == 'attr' or dep == 'acomp':
-            # Copula complement: "is black" -> black is the THEME-ish
-            # complement. We file it under MODIFIER per the v1 role table
-            # (no separate THEME role was locked in the spec — flag this
-            # if you want THEME added back as a distinct role).
-            roles.append({'role': 'MODIFIER', 'entity_text': child.text,
+            # Copula complement: "is black" -> black is a predicated
+            # ATTRIBUTE of the subject, not a MODIFIER (an adjunct on the
+            # verb). v9 FIX: this was previously hardcoded to MODIFIER —
+            # see v9 change log at top of file. CONFIRMED via clustering
+            # diagnostic: attr/acomp fillers ("dear", "severity", "course",
+            # "dizzy") share no semantic relationship with true MODIFIER
+            # fillers (adverbial/adjectival adjuncts) and were dragging
+            # that bucket's avg_sim down. Promoted to its own role so the
+            # composition function can learn it as a distinct relation
+            # instead of inheriting MODIFIER's noise.
+            roles.append({'role': 'ATTRIBUTE', 'entity_text': child.text,
                           'is_pronoun': False})
         elif dep == 'prep':
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
@@ -644,7 +683,7 @@ def dump_events(output):
 
 if __name__ == "__main__":
     
-    print(">>> RUNNING preprocess.py VERSION: v8-contraction-and-modal-verb-normalization <<<")
+    print(">>> RUNNING preprocess.py VERSION: v9-attribute-role-and-motion-preps <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # graph_peg_v17.py — MLP predictor + InfoNCE, tuned for large corpus
-# VERSION MARKER: v18-fix-context-role-magnitude-imbalance
+# VERSION MARKER: v19-add-attribute-role
 
 import torch
 import torch.nn as nn
@@ -40,9 +40,16 @@ class GraphPEGModel(nn.Module):
         self.dataset = dataset
 
         # vocab
+        # v18 NOTE: 'ATTRIBUTE' added here to match preprocess.py v9, which
+        # split copula complements (attr/acomp — "is tired", "is a carpenter")
+        # out of MODIFIER into their own role. Without this entry, any
+        # dataset built with the v9+ preprocessor raises KeyError on the
+        # first ATTRIBUTE-bearing event, since this dict is the model's
+        # only source of truth for which roles have an embedding slot.
         self.role_to_idx = {
             'AGENT': 0, 'PATIENT': 1, 'RECIPIENT': 2, 'LOCATION': 3,
-            'TIME': 4, 'MANNER': 5, 'MODIFIER': 6, 'POLARITY': 7, 'MOOD': 8
+            'TIME': 4, 'MANNER': 5, 'MODIFIER': 6, 'POLARITY': 7, 'MOOD': 8,
+            'ATTRIBUTE': 9
         }
         self.idx_to_role = {v: k for k, v in self.role_to_idx.items()}
         self.num_roles = len(self.role_to_idx)
@@ -397,7 +404,14 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
         if child.dep_ == 'nsubj':
             roles1.append({'role': 'AGENT', 'entity_text': child.text})
         elif child.dep_ in ('attr', 'acomp'):
-            roles1.append({'role': 'MODIFIER', 'entity_text': child.text})
+            # v18 FIX: this used to emit 'MODIFIER', which was correct for
+            # the v1-v8 preprocessor but is now stale — preprocess.py v9
+            # gives attr/acomp their own ATTRIBUTE role (see that file's
+            # changelog). Leaving this as MODIFIER would silently test
+            # against a role-mapping rule the real pipeline no longer
+            # uses, making this novelty test unrepresentative of current
+            # training data.
+            roles1.append({'role': 'ATTRIBUTE', 'entity_text': child.text})
     print(f"  Sentence: {new_sentence1!r}")
     surprises1, status1 = compute_surprise_for_new_event(event_type1, roles1)
     for role, val in surprises1.items():
@@ -422,6 +436,12 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
     print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
     new_sentence3 = "Zorp the alien arrived."
     event_type3 = "arrive"
+    # NOTE: MODIFIER is correct here, unlike Test 1's old bug — "alien" is
+    # an appositive modifying "Zorp", not a copula complement (there's no
+    # attr/acomp dependency here; "arrive" isn't a copula verb). The v9
+    # preprocess.py fix only redirected attr/acomp -> ATTRIBUTE; it left
+    # appositives and amod-style modifiers under MODIFIER, since no better
+    # role exists for them yet.
     roles3 = [
         {'role': 'AGENT', 'entity_text': 'Zorp'},
         {'role': 'MODIFIER', 'entity_text': 'alien'}
@@ -434,7 +454,12 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 
     # --- Interpretation ---
     print("\n--- Interpretation ---")
-    print(f"  Test 1 (carpenter): MODIFIER surprise = {surprises1.get('MODIFIER', 0.0):.4f}")
+    # v19 FIX: Test 1 now extracts role 'ATTRIBUTE' (see fix above), so the
+    # lookup key here must match — this was still reading 'MODIFIER' and
+    # would have silently printed 0.0 every run via the .get() fallback,
+    # which is a much worse failure mode than a KeyError: it looks like a
+    # real (and suspiciously perfect) result instead of an obvious bug.
+    print(f"  Test 1 (carpenter): ATTRIBUTE surprise = {surprises1.get('ATTRIBUTE', 0.0):.4f}")
     print(f"  Test 2 (dance):    AGENT surprise    = {surprises2.get('AGENT', 0.0):.4f}")
     print(f"  Test 3 (Zorp):     AGENT surprise    = {surprises3.get('AGENT', 0.0):.4f}")
     print(f"  Test 3 (alien):    MODIFIER surprise = {surprises3.get('MODIFIER', 0.0):.4f}")
@@ -449,7 +474,7 @@ def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
 # --------------------------------------------------------------------
 if __name__ == "__main__":
     import sys
-    print(">>> RUNNING graph_peg.py VERSION: v18-fix-context-role-magnitude-imbalance <<<")
+    print(">>> RUNNING graph_peg.py VERSION: v19-add-attribute-role <<<")
 
     if len(sys.argv) < 2:
         print("Usage: python3 graph_peg_v17.py <graph_corpus.pkl> [epochs]")

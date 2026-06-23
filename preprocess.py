@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v12 (coordination + feature logging)
-# VERSION MARKER: v12-coordination-logging
+# preprocess.py — Graph‑PEG dataset generator, v13 (interrogative detection)
+# VERSION MARKER: v13-interrogative
 
 import argparse
 import pickle
@@ -32,8 +32,8 @@ SOURCE_RELIABILITY = {
     'relcl_inherited': 0.55,
     'relcl_antecedent': 0.75,
     'neg_flag': 1.0,
-    'direct_npadvmod': 0.8,          # v11: added
-    # v12: sources for conjuncts (slightly lower reliability)
+    'direct_npadvmod': 0.8,
+    # v12: sources for conjuncts
     'direct_nsubj_conj': 0.9,
     'direct_dobj_conj': 0.9,
     'prep_pobj_conj': 0.85,
@@ -260,6 +260,46 @@ def expand_filler(token, visited=None) -> Generator:
             yield from expand_filler(child, visited)
 
 
+# v13: syntactic interrogative detection
+def is_interrogative(doc) -> bool:
+    """
+    Returns True if the sentence is an interrogative (question).
+    Checks for:
+    1. Trailing '?'.
+    2. Subject-auxiliary inversion: AUX before nsubj for the ROOT verb.
+    """
+    text = doc.text.strip()
+    if text.endswith('?'):
+        return True
+
+    # Find the root verb
+    root = None
+    for token in doc:
+        if token.dep_ == 'ROOT':
+            root = token
+            break
+    if root is None:
+        return False
+
+    # Check for auxiliary before subject
+    aux_before_subj = False
+    subj_after_aux = False
+    aux_token = None
+    subj_token = None
+
+    for token in doc:
+        if token.dep_ == 'aux' and token.head == root:
+            aux_token = token
+        if token.dep_ == 'nsubj' and token.head == root:
+            subj_token = token
+
+    if aux_token is not None and subj_token is not None:
+        if aux_token.i < subj_token.i:
+            return True
+
+    return False
+
+
 def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
     """
     Extracts one event, including provenance and feature logging.
@@ -274,7 +314,6 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
 
     def add_role(role, entity_text, is_pronoun, source, origin_token, origin_dep,
                  weight=1.0, entity_token=None, is_conjunct=False):
-        # Validate the entity token (origin_token is the source of the relation)
         validate_token = entity_token if entity_token is not None else origin_token
         if not is_valid_filler(validate_token, role):
             return
@@ -293,10 +332,9 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             'weight': weight,
             'confidence': confidence,
             'reliability': reliability,
-            'is_conjunct': is_conjunct,  # v12: mark if this came from a conj/appos
+            'is_conjunct': is_conjunct,
         })
 
-        # v12: Log feature vector for machine learning
         feature_log.append({
             'verb': event_type,
             'role': refined,
@@ -316,12 +354,9 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
         dep = child.dep_
 
         if dep in ('nsubj', 'nsubjpass'):
-            # v12: expand coordination/appositives for subjects
             source = 'direct_nsubj'
             for idx, filler in enumerate(expand_filler(child)):
-                # First token (the head) gets full weight; conjuncts get 0.9
                 weight = 1.0 if idx == 0 else 0.9
-                # For conjuncts, modify the source to indicate it's a conjunct
                 source_actual = source if idx == 0 else f"{source}_conj"
                 add_role('AGENT', filler.text, filler.text.lower() in PRONOUNS,
                          source_actual, child, dep, weight=weight, entity_token=filler,
@@ -351,7 +386,6 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             if prep_objs:
                 obj = prep_objs[0]
                 role = map_prep_role(child, obj)
-                # v12: expand coordination for prepositional objects
                 source = 'prep_pobj'
                 for idx, filler in enumerate(expand_filler(obj)):
                     weight = 1.0 if idx == 0 else 0.9
@@ -434,7 +468,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                      'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
 
-    mood = 'interrogative' if doc.text.strip().endswith('?') else 'declarative'
+    # v13: mood detection using both syntax and punctuation
+    mood = 'interrogative' if is_interrogative(doc) else 'declarative'
     polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
 
     return {
@@ -446,7 +481,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             'polarity': polarity,
             'predicate_dep': pred_token.dep_,
         },
-        'feature_log': feature_log,  # v12: include per-event feature log
+        'feature_log': feature_log,
     }
 
 
@@ -479,7 +514,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
     unresolved = []
     event_types: Dict[str, int] = {}
     event_id_counter = 0
-    global_feature_log = []  # v12: collect all feature vectors across all events
+    global_feature_log = []
 
     for sent_idx, sent in enumerate(corpus):
         doc = nlp(sent)
@@ -501,7 +536,6 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                 event_types[event_type] = len(event_types)
 
             role_entries = []
-            # v12: collect features from this event
             event_features = ev.get('feature_log', [])
 
             for r in ev['roles']:
@@ -553,7 +587,6 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
             })
             event_id_counter += 1
 
-            # v12: store features globally
             global_feature_log.extend(event_features)
 
     output = {
@@ -561,7 +594,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
         'events': all_events,
         'event_types': event_types,
         'unresolved': unresolved,
-        'feature_log': global_feature_log,  # v12: include in output
+        'feature_log': global_feature_log,
     }
 
     with open(output_file, 'wb') as f:
@@ -646,7 +679,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v12-coordination-logging <<<")
+    print(">>> RUNNING preprocess.py VERSION: v13-interrogative <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

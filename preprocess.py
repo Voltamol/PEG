@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v11 (fixed validation + npadvmod)
-# VERSION MARKER: v11-entity-validation
+# preprocess.py — Graph‑PEG dataset generator, v12 (coordination + feature logging)
+# VERSION MARKER: v12-coordination-logging
 
 import argparse
 import pickle
 import sys
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Generator
 
 import torch
 import spacy
@@ -31,8 +31,14 @@ SOURCE_RELIABILITY = {
     'conj_inherited': 0.6,
     'relcl_inherited': 0.55,
     'relcl_antecedent': 0.75,
-    'neg_flag': 1.0,          # polarity flags are exact
-    'direct_npadvmod': 0.8,   # noun-phrase adverbial modifiers (usually time/location)
+    'neg_flag': 1.0,
+    'direct_npadvmod': 0.8,          # v11: added
+    # v12: sources for conjuncts (slightly lower reliability)
+    'direct_nsubj_conj': 0.9,
+    'direct_dobj_conj': 0.9,
+    'prep_pobj_conj': 0.85,
+    'direct_iobj_conj': 0.85,
+    'appos_inherited': 0.8,
 }
 
 # v10: blacklist for ambiguous/placeholder fillers
@@ -47,11 +53,11 @@ ROLE_POS_ALLOWED = {
     'PATIENT':   {'NOUN', 'PROPN', 'PRON'},
     'RECIPIENT': {'NOUN', 'PROPN', 'PRON'},
     'LOCATION':  {'NOUN', 'PROPN'},
-    'TIME':      {'NOUN', 'PROPN'},   # times can be proper nouns (e.g., "Sunday")
-    'MANNER':    {'ADV', 'NOUN'},     # adverbs or noun‑phrases (e.g., "with care")
+    'TIME':      {'NOUN', 'PROPN'},
+    'MANNER':    {'ADV', 'NOUN'},
     'ATTRIBUTE': {'ADJ', 'NOUN', 'PROPN'},
-    'MODIFIER':  None,                # any, but will be refined later
-    'POLARITY':  None,                # flag, no entity
+    'MODIFIER':  None,
+    'POLARITY':  None,
 }
 
 # --------------------------------------------------------------------
@@ -134,11 +140,11 @@ PRONOUNS = {
 # --------------------------------------------------------------------
 DEP_TO_ROLE = {
     'nsubj': 'AGENT',
-    'nsubjpass': 'PATIENT',      # passive subject = patient
+    'nsubjpass': 'PATIENT',
     'dobj': 'PATIENT',
     'iobj': 'RECIPIENT',
     'dative': 'RECIPIENT',
-    'pobj': None,                # handled specially via prep
+    'pobj': None,
     'advmod': 'MANNER',
     'neg': 'POLARITY',
     'amod': 'MODIFIER',
@@ -149,7 +155,6 @@ LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind',
                   'beneath', 'beside', 'within', 'above', 'below'}
 TIME_PREPS = {'at', 'on', 'in', 'during', 'after', 'before', 'since', 'until'}
 
-# Expanded TIME noun list (from previous feedback)
 TIME_NOUNS = {
     'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
     'saturday', 'sundays', 'mondays', 'tuesdays', 'wednesdays',
@@ -160,48 +165,27 @@ TIME_NOUNS = {
     'august', 'september', 'october', 'november', 'december',
     'minute', 'hour', 'day', 'week', 'month', 'year', 'decade',
     'minutes', 'hours', 'days', 'weeks', 'months', 'years', 'decades',
-    'attempt', 'attempts', 'occasion', 'occasions',  # "after several attempts"
-    'today', 'tomorrow', 'yesterday', 'tonight',  # NEW: common time nouns
+    'attempt', 'attempts', 'occasion', 'occasions',
+    'today', 'tomorrow', 'yesterday', 'tonight',
 }
 
 def map_prep_role(prep_token, prep_obj_token=None) -> str:
-    """
-    Determines role of a prepositional phrase.
-    TIME fix: only assign TIME if the preposition is in TIME_PREPS AND
-    the object lemma is in TIME_NOUNS (or the text is a time noun).
-    Otherwise, default to LOCATION (or MODIFIER if not in LOCATION_PREPS).
-    """
     lemma = prep_token.lemma_.lower()
     obj_lemma = prep_obj_token.lemma_.lower() if prep_obj_token is not None else ''
     obj_text = prep_obj_token.text.lower() if prep_obj_token is not None else ''
 
-    # First, if it's a clear time expression
     if lemma in TIME_PREPS and (obj_lemma in TIME_NOUNS or obj_text in TIME_NOUNS):
         return 'TIME'
-
-    # If it's a location preposition, even if the object is not in TIME_NOUNS
     if lemma in LOCATION_PREPS:
         return 'LOCATION'
-
-    # Everything else becomes MODIFIER (can be refined later)
     return 'MODIFIER'
 
 
 def refine_role(event_type: str, role_name: str, token) -> str:
-    """
-    Refines a generic role (MODIFIER, LOCATION, etc.) into a more specific one
-    based on the event type and dependency relation.
-    """
     if role_name == 'MODIFIER' and token.dep_ in ('attr', 'acomp'):
-        # Copula complement (predicate adjective/nominal)
         if event_type in ('be', 'seem', 'become', 'appear', 'remain', 'stay',
                           'look', 'feel', 'smell', 'taste', 'sound', 'keep'):
             return 'ATTRIBUTE'
-    if role_name == 'LOCATION' and token.dep_ == 'prep' and token.lemma_ == 'with':
-        # Could be INSTRUMENT (but we need to know the verb)
-        # We'll keep as LOCATION for now; can be overridden later.
-        pass
-    # Keep as is
     return role_name
 
 
@@ -218,7 +202,6 @@ CONTRACTION_LEMMA_MAP = {
     'twas': 'be', "'twas": 'be',
     'doth': 'do', 'dost': 'do',
     'hath': 'have',
-    # Add standalone apostrophe (sometimes root)
     "'": 'be', "’": 'be',
 }
 
@@ -239,9 +222,6 @@ OBJECT_CONTROL_VERBS = {
 
 
 def find_predicate_tokens(doc):
-    """
-    Returns all verb/aux tokens that can be predicates (excluding aux, amod).
-    """
     predicates = []
     for tok in doc:
         if tok.pos_ in ('VERB', 'AUX') and tok.dep_ not in ('aux', 'auxpass', 'amod'):
@@ -249,54 +229,57 @@ def find_predicate_tokens(doc):
     return predicates
 
 
-# v10: validation function
 def is_valid_filler(token, role):
-    """Check if a token is a plausible filler for the given role."""
-    # First, reject obvious non‑entity POS
     if token.pos_ in {'VERB', 'AUX', 'PART', 'SCONJ', 'CCONJ', 'PUNCT', 'SYM'}:
         return False
-
-    # For POLARITY, the filler is not a real entity, so always valid (handled separately)
     if role == 'POLARITY':
         return True
-
-    # Check POS against allowed list (if any)
     allowed = ROLE_POS_ALLOWED.get(role)
     if allowed is not None and token.pos_ not in allowed:
         return False
-
-    # For concrete roles, reject blacklisted tokens
     if role in {'AGENT', 'PATIENT', 'RECIPIENT', 'LOCATION', 'TIME'}:
         if token.text.lower() in ENTITY_BLACKLIST:
             return False
-
     return True
 
 
-def extract_event_for_predicate(pred_token, sent_idx, doc):
+# v12: recursive expansion of conjunctions and appositives
+def expand_filler(token, visited=None) -> Generator:
     """
-    Extracts one event, including provenance (source, origin token, dep).
-    Returns a dict with:
-      - event_type: str
-      - roles: list of dict with keys: role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight, confidence
-      - metadata: dict
+    Recursively yield the token and all its coordinated/apposited children.
+    Handles: 'John, Mary, and Sam' and 'John (my brother)'.
+    """
+    if visited is None:
+        visited = set()
+    if token.i in visited:
+        return
+    visited.add(token.i)
+    yield token
+    for child in token.children:
+        if child.dep_ in ('conj', 'appos'):
+            yield from expand_filler(child, visited)
+
+
+def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
+    """
+    Extracts one event, including provenance and feature logging.
     """
     event_type = normalize_event_type(pred_token.lemma_)
     if event_type is None:
         return None
 
     roles = []
+    if feature_log is None:
+        feature_log = []
 
-    # Helper to add a role, tracking provenance and validation
-    # FIX: added entity_token parameter for validation (for prep phrases we pass the pobj)
-    def add_role(role, entity_text, is_pronoun, source, origin_token, origin_dep, weight=1.0, entity_token=None):
-        # If entity_token is not provided, use origin_token for validation
+    def add_role(role, entity_text, is_pronoun, source, origin_token, origin_dep,
+                 weight=1.0, entity_token=None, is_conjunct=False):
+        # Validate the entity token (origin_token is the source of the relation)
         validate_token = entity_token if entity_token is not None else origin_token
         if not is_valid_filler(validate_token, role):
             return
 
         refined = refine_role(event_type, role, origin_token)
-        # v10: compute confidence from source reliability
         reliability = SOURCE_RELIABILITY.get(source, 0.5)
         confidence = weight * reliability
 
@@ -310,49 +293,86 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             'weight': weight,
             'confidence': confidence,
             'reliability': reliability,
+            'is_conjunct': is_conjunct,  # v12: mark if this came from a conj/appos
+        })
+
+        # v12: Log feature vector for machine learning
+        feature_log.append({
+            'verb': event_type,
+            'role': refined,
+            'filler': entity_text,
+            'filler_pos': validate_token.pos_,
+            'dep': origin_dep,
+            'source': source,
+            'is_pronoun': is_pronoun,
+            'is_conjunct': is_conjunct,
+            'weight': weight,
+            'confidence': confidence,
+            'sentence_idx': sent_idx,
         })
 
     # Process direct children of the predicate
     for child in pred_token.children:
         dep = child.dep_
+
         if dep in ('nsubj', 'nsubjpass'):
-            add_role('AGENT', child.text, child.text.lower() in PRONOUNS,
-                     'direct_nsubj', child, dep)
+            # v12: expand coordination/appositives for subjects
+            source = 'direct_nsubj'
+            for idx, filler in enumerate(expand_filler(child)):
+                # First token (the head) gets full weight; conjuncts get 0.9
+                weight = 1.0 if idx == 0 else 0.9
+                # For conjuncts, modify the source to indicate it's a conjunct
+                source_actual = source if idx == 0 else f"{source}_conj"
+                add_role('AGENT', filler.text, filler.text.lower() in PRONOUNS,
+                         source_actual, child, dep, weight=weight, entity_token=filler,
+                         is_conjunct=(idx > 0))
+
         elif dep == 'dobj':
-            add_role('PATIENT', child.text, child.text.lower() in PRONOUNS,
-                     'direct_dobj', child, dep)
+            source = 'direct_dobj'
+            for idx, filler in enumerate(expand_filler(child)):
+                weight = 1.0 if idx == 0 else 0.9
+                source_actual = source if idx == 0 else f"{source}_conj"
+                add_role('PATIENT', filler.text, filler.text.lower() in PRONOUNS,
+                         source_actual, child, dep, weight=weight, entity_token=filler,
+                         is_conjunct=(idx > 0))
+
         elif dep in ('iobj', 'dative'):
-            # If the dative token is a preposition, look for pobj
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
             filler = prep_objs[0] if prep_objs else child
             add_role('RECIPIENT', filler.text, filler.text.lower() in PRONOUNS,
                      'direct_iobj', child, dep)
+
         elif dep == 'attr' or dep == 'acomp':
-            # Copula complement: will be refined to ATTRIBUTE later
             add_role('MODIFIER', child.text, False,
                      'direct_comp', child, dep)
+
         elif dep == 'prep':
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
             if prep_objs:
                 obj = prep_objs[0]
                 role = map_prep_role(child, obj)
-                # FIX: pass obj as entity_token for validation
-                add_role(role, obj.text, obj.text.lower() in PRONOUNS,
-                         'prep_pobj', child, dep, entity_token=obj)
+                # v12: expand coordination for prepositional objects
+                source = 'prep_pobj'
+                for idx, filler in enumerate(expand_filler(obj)):
+                    weight = 1.0 if idx == 0 else 0.9
+                    source_actual = source if idx == 0 else f"{source}_conj"
+                    add_role(role, filler.text, filler.text.lower() in PRONOUNS,
+                             source_actual, child, dep, weight=weight, entity_token=filler,
+                             is_conjunct=(idx > 0))
+
         elif dep == 'advmod':
             add_role('MANNER', child.text, False,
                      'direct_advmod', child, dep)
-        # NEW: handle npadvmod (noun phrase adverbial modifier) – often time expressions
+
         elif dep == 'npadvmod':
-            # Determine if it's a time noun
             if child.lemma_.lower() in TIME_NOUNS or child.text.lower() in TIME_NOUNS:
                 role = 'TIME'
             else:
                 role = 'MANNER'
             add_role(role, child.text, child.text.lower() in PRONOUNS,
                      'direct_npadvmod', child, dep)
+
         elif dep == 'neg':
-            # POLARITY is a flag, not a real entity
             roles.append({
                 'role': 'POLARITY',
                 'entity_text': 'negative',
@@ -363,22 +383,19 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
                 'weight': 1.0,
                 'confidence': 1.0,
                 'reliability': 1.0,
+                'is_conjunct': False,
             })
 
     # ---- Subject inheritance for control/raising/relcl ----
-    # Inherit subject from matrix verb if this predicate is a complement or relative clause
     if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl', 'relcl'):
         matrix = pred_token.head
-        # Check if we already have an AGENT from a direct child (e.g., relative pronoun)
         has_agent = any(r['role'] == 'AGENT' for r in roles)
 
-        # For relative clauses, if we have an AGENT that is a relative pronoun, replace it with the antecedent
         RELATIVE_PRONOUNS = {'that', 'which', 'who', 'whom', 'whose'}
         if pred_token.dep_ == 'relcl':
             antecedent = matrix.text
             for r in roles:
                 if r['role'] == 'AGENT' and r['entity_text'].lower() in RELATIVE_PRONOUNS:
-                    # Replace with antecedent, but also validate the antecedent token (matrix)
                     if is_valid_filler(matrix, 'AGENT'):
                         r['entity_text'] = antecedent
                         r['is_pronoun'] = False
@@ -390,19 +407,15 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
                         r['confidence'] = r['weight'] * r['reliability']
                     break
             else:
-                # No relative pronoun AGENT, so we might need to inherit
                 if not has_agent:
-                    # Inherit from matrix subject
                     matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
                     if matrix_subj and is_valid_filler(matrix_subj, 'AGENT'):
                         add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                                  'relcl_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
         else:
-            # Control/raising: inherit subject from matrix
             if not has_agent:
                 matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
                 matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
-                # Object control vs subject control
                 if matrix.lemma_.lower() in OBJECT_CONTROL_VERBS and matrix_dobj is not None:
                     inherited = matrix_dobj
                     source = 'obj_control'
@@ -413,7 +426,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
                     add_role('AGENT', inherited.text, inherited.text.lower() in PRONOUNS,
                              source, inherited, inherited.dep_, weight=0.7)
 
-    # Conjunction handling: if this predicate is a conj, inherit subject from the head verb's subject
+    # Conjunction handling for verbs (inherit subject)
     if pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
         matrix = pred_token.head
         matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
@@ -421,7 +434,6 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                      'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
 
-    # Mood and polarity
     mood = 'interrogative' if doc.text.strip().endswith('?') else 'declarative'
     polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
 
@@ -433,7 +445,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             'mood': mood,
             'polarity': polarity,
             'predicate_dep': pred_token.dep_,
-        }
+        },
+        'feature_log': feature_log,  # v12: include per-event feature log
     }
 
 
@@ -447,7 +460,6 @@ def extract_events(doc, sent_idx):
         if ev['roles']:
             events.append(ev)
         else:
-            # Warn only if it's not a bare modal (already filtered)
             if pred.lemma_.lower() not in BARE_MODAL_LEMMAS:
                 print(f"  [WARN] predicate '{pred.text}' (dep={pred.dep_}) "
                       f"in sentence {sent_idx} produced zero roles — check parse.")
@@ -467,6 +479,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
     unresolved = []
     event_types: Dict[str, int] = {}
     event_id_counter = 0
+    global_feature_log = []  # v12: collect all feature vectors across all events
 
     for sent_idx, sent in enumerate(corpus):
         doc = nlp(sent)
@@ -488,9 +501,11 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                 event_types[event_type] = len(event_types)
 
             role_entries = []
+            # v12: collect features from this event
+            event_features = ev.get('feature_log', [])
+
             for r in ev['roles']:
                 if r['entity_text'] == 'negative':
-                    # POLARITY flag: no real entity
                     role_entries.append({
                         'role': r['role'],
                         'entity_id': None,
@@ -501,13 +516,13 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                         'origin_dep': r.get('origin_dep', ''),
                         'weight': r.get('weight', 1.0),
                         'reliability': r.get('reliability', 1.0),
+                        'is_conjunct': r.get('is_conjunct', False),
                     })
                     continue
 
                 eid, mention_idx = registry.resolve_or_create(
                     r['entity_text'], sent_idx, r['is_pronoun'])
 
-                # Confidence already computed in add_role; store it
                 confidence = r.get('confidence', r.get('weight', 0.5))
                 if r['is_pronoun']:
                     unresolved.append({
@@ -526,6 +541,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                     'origin_dep': r.get('origin_dep', ''),
                     'weight': r.get('weight', 1.0),
                     'reliability': r.get('reliability', 1.0),
+                    'is_conjunct': r.get('is_conjunct', False),
                 })
 
             all_events.append({
@@ -537,11 +553,15 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
             })
             event_id_counter += 1
 
+            # v12: store features globally
+            global_feature_log.extend(event_features)
+
     output = {
         'entities': registry.entities,
         'events': all_events,
         'event_types': event_types,
         'unresolved': unresolved,
+        'feature_log': global_feature_log,  # v12: include in output
     }
 
     with open(output_file, 'wb') as f:
@@ -550,6 +570,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
     print(f"\nSaved graph corpus to {output_file}")
     print(f"Entities: {len(registry.entities)}, Events: {len(all_events)}, "
           f"Unresolved pronoun mentions: {len(unresolved)}")
+    print(f"Feature vectors logged: {len(global_feature_log)}")
     return output
 
 
@@ -568,7 +589,6 @@ def run_self_checks(output, is_demo_corpus=True):
         by_type.setdefault(e['event_type'], []).append(e)
 
     errors = []
-    # Check for 'chase' event (relative clause test)
     if 'chase' not in by_type:
         errors.append("Expected an event for 'chase' (from 'chased').")
     else:
@@ -602,7 +622,7 @@ def run_self_checks(output, is_demo_corpus=True):
 
 
 # --------------------------------------------------------------------
-# 7. DUMP EVENTS (updated to show confidence)
+# 7. DUMP EVENTS (updated to show is_conjunct)
 # --------------------------------------------------------------------
 def dump_events(output):
     print("\n=== FULL EVENT DUMP ===")
@@ -613,11 +633,11 @@ def dump_events(output):
                 filler = '(flag)'
             else:
                 filler = output['entities'][r['entity_id']]['canonical_text']
-            # Show source, weight, and confidence
             src = r.get('source', '?')
             wt = r.get('weight', 1.0)
             conf = r.get('confidence', wt)
-            role_strs.append(f"{r['role']}={filler}(src={src},wt={wt:.2f},conf={conf:.2f})")
+            conj = ' C' if r.get('is_conjunct', False) else ''
+            role_strs.append(f"{r['role']}={filler}(src={src}{conj},wt={wt:.2f},conf={conf:.2f})")
         print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
               f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")
 
@@ -626,7 +646,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v11-entity-validation <<<")
+    print(">>> RUNNING preprocess.py VERSION: v12-coordination-logging <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')
@@ -640,7 +660,6 @@ if __name__ == "__main__":
                          help='Output pickle path.')
     args = parser.parse_args()
 
-    # Determine input source
     if args.text is not None:
         corpus = [args.text]
         is_demo = False

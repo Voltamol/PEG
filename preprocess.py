@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v17 (coreference resolution)
-# VERSION MARKER: v17-coref
+# preprocess.py — Graph‑PEG dataset generator, v18 (fast-coref)
+# VERSION MARKER: v18-fast-coref
 
 import argparse
 import pickle
@@ -11,14 +11,23 @@ import torch
 import spacy
 from sentence_transformers import SentenceTransformer
 
-# v17: coreferee support (optional)
+# v18: use fast-coref for coreference resolution
 try:
-    import coreferee
+    from fastcoref import CorefModel
     COREF_AVAILABLE = True
 except ImportError:
     COREF_AVAILABLE = False
-    print("  [INFO] coreferee not installed. Coreference resolution disabled.")
-    print("  Install with: pip install coreferee")
+    print("  [INFO] fast-coref not installed. Coreference resolution disabled.")
+    print("  Install with: pip install fast-coref")
+
+# Global coref model (loaded once)
+_coref_model = None
+
+def get_coref_model():
+    global _coref_model
+    if _coref_model is None and COREF_AVAILABLE:
+        _coref_model = CorefModel()
+    return _coref_model
 
 # --------------------------------------------------------------------
 # 1. CONFIGURATION
@@ -307,32 +316,46 @@ def has_local_negation(pred_token) -> bool:
     return False
 
 
-# v17: coreference map builder
+# v18: fast-coref coreference map builder
 def get_coref_map(doc):
     """
-    Build a mapping from token index to the canonical (main) mention text.
-    Uses coreferee if available.
+    Build a mapping from token index to canonical mention text using fast-coref.
     """
     coref_map = {}
     if not COREF_AVAILABLE:
         return coref_map
-    if not hasattr(doc._, 'coref_clusters'):
-        return coref_map
 
-    for cluster in doc._.coref_clusters:
-        # Find the best main mention (try to get a non-pronoun)
-        main_text = cluster.main.text
-        if main_text.lower() in PRONOUNS:
-            # Look for a non-pronoun mention in the cluster
-            for mention in cluster.mentions:
-                if mention.text.lower() not in PRONOUNS:
-                    main_text = mention.text
-                    break
+    try:
+        model = get_coref_model()
+        if model is None:
+            return coref_map
 
-        # Map every token in every mention to the main text
-        for mention in cluster.mentions:
-            for token in mention:
-                coref_map[token.i] = main_text
+        text = doc.text
+        clusters = model(text)  # list of clusters
+
+        for cluster in clusters:
+            mentions = cluster['mentions']
+            # Choose the main mention: prefer non-pronoun, longest
+            best = None
+            for m in mentions:
+                if m['text'].lower() not in PRONOUNS:
+                    if best is None or len(m['text']) > len(best['text']):
+                        best = m
+            if best is None and mentions:
+                best = mentions[0]
+            if best is None:
+                continue
+            main_text = best['text']
+
+            # Map each mention's tokens to main_text
+            for m in mentions:
+                start_char = m['start']
+                end_char = m['end']
+                for token in doc:
+                    if token.idx >= start_char and token.idx + len(token.text) <= end_char:
+                        coref_map[token.i] = main_text
+    except Exception as e:
+        print(f"  [WARN] coref failed: {e}")
 
     return coref_map
 
@@ -539,14 +562,6 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                output_file='graph_corpus.pkl', debug=False):
     nlp = spacy.load('en_core_web_sm')
 
-    # v17: add coreferee if available
-    if COREF_AVAILABLE:
-        try:
-            nlp.add_pipe('coreferee')
-            print("  [INFO] Coreferee pipeline added.")
-        except Exception as e:
-            print(f"  [WARN] Could not add coreferee: {e}")
-
     encoder = SentenceTransformer(model_name)
     registry = EntityRegistry(encoder)
 
@@ -560,7 +575,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
         sent = normalise_punctuation(sent)
         doc = nlp(sent)
 
-        # v17: build coreference map for this document
+        # v18: build coreference map for this document
         coref_map = get_coref_map(doc)
 
         if debug:
@@ -600,7 +615,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                     })
                     continue
 
-                # v17: coreference resolution for pronouns
+                # v18: coreference resolution for pronouns
                 entity_text = r['entity_text']
                 is_pronoun = r['is_pronoun']
 
@@ -740,7 +755,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v17-coref <<<")
+    print(">>> RUNNING preprocess.py VERSION: v18-fast-coref <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

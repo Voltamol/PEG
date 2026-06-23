@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v15 (punctuation normalisation)
-# VERSION MARKER: v15-punctuation-normalisation
+# preprocess.py — Graph‑PEG dataset generator, v16 (local negation)
+# VERSION MARKER: v16-local-negation
 
 import argparse
 import pickle
@@ -301,10 +301,35 @@ def is_interrogative(doc_or_span) -> bool:
 # v15: punctuation normalisation to help sentence segmentation
 def normalise_punctuation(text: str) -> str:
     """Normalise ambiguous punctuation that confuses spaCy's sentence boundary detection."""
-    # Replace "?," and "?." with "? " to force a sentence break
     text = text.replace("?,", "? ").replace("?.", "? ")
     text = text.replace("!,", "! ").replace("!.", "! ")
     return text
+
+
+# v16: local negation detection (does NOT descend into clausal complements)
+def has_local_negation(pred_token) -> bool:
+    """
+    Check for negation directly attached to the predicate or its auxiliary chain.
+    Does NOT descend into clausal complements (ccomp, advcl, xcomp).
+    """
+    # 1. Check if the predicate itself has a 'neg' child
+    for child in pred_token.children:
+        if child.dep_ == 'neg':
+            return True
+        # 2. Check if an auxiliary (aux) has a 'neg' child (e.g., "doesn't")
+        if child.dep_ == 'aux':
+            for grandchild in child.children:
+                if grandchild.dep_ == 'neg':
+                    return True
+            # 3. Check if the auxiliary token ends with "n't" (e.g., "don't" as a single token)
+            if child.text.lower().endswith("n't"):
+                return True
+
+    # 4. Check if the predicate text itself ends with "n't" (e.g., "can't")
+    if pred_token.text.lower().endswith("n't"):
+        return True
+
+    return False
 
 
 def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
@@ -477,7 +502,9 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
 
     # v14: mood detection per sentence (using pred_token.sent, not the full doc)
     mood = 'interrogative' if is_interrogative(pred_token.sent) else 'declarative'
-    polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
+
+    # v16: use local negation detection (does not leak from embedded clauses)
+    polarity = 'negative' if has_local_negation(pred_token) else 'positive'
 
     return {
         'event_type': event_type,
@@ -524,7 +551,6 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
     global_feature_log = []
 
     for sent_idx, sent in enumerate(corpus):
-        # v15: normalise punctuation before parsing
         sent = normalise_punctuation(sent)
         doc = nlp(sent)
 
@@ -688,7 +714,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v15-punctuation-normalisation <<<")
+    print(">>> RUNNING preprocess.py VERSION: v16-local-negation <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

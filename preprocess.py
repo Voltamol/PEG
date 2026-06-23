@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v14 (mood per sentence)
-# VERSION MARKER: v14-mood-per-sentence
+# preprocess.py — Graph‑PEG dataset generator, v15 (punctuation normalisation)
+# VERSION MARKER: v15-punctuation-normalisation
 
 import argparse
 import pickle
@@ -298,6 +298,15 @@ def is_interrogative(doc_or_span) -> bool:
     return False
 
 
+# v15: punctuation normalisation to help sentence segmentation
+def normalise_punctuation(text: str) -> str:
+    """Normalise ambiguous punctuation that confuses spaCy's sentence boundary detection."""
+    # Replace "?," and "?." with "? " to force a sentence break
+    text = text.replace("?,", "? ").replace("?.", "? ")
+    text = text.replace("!,", "! ").replace("!.", "! ")
+    return text
+
+
 def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
     """
     Extracts one event, including provenance and feature logging.
@@ -515,6 +524,8 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
     global_feature_log = []
 
     for sent_idx, sent in enumerate(corpus):
+        # v15: normalise punctuation before parsing
+        sent = normalise_punctuation(sent)
         doc = nlp(sent)
 
         if debug:
@@ -677,7 +688,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v14-mood-per-sentence <<<")
+    print(">>> RUNNING preprocess.py VERSION: v15-punctuation-normalisation <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

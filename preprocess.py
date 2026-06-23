@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v13 (interrogative detection)
-# VERSION MARKER: v13-interrogative
+# preprocess.py — Graph‑PEG dataset generator, v14 (mood per sentence)
+# VERSION MARKER: v14-mood-per-sentence
 
 import argparse
 import pickle
@@ -260,21 +260,21 @@ def expand_filler(token, visited=None) -> Generator:
             yield from expand_filler(child, visited)
 
 
-# v13: syntactic interrogative detection
-def is_interrogative(doc) -> bool:
+# v13: syntactic interrogative detection (works with Doc or Span)
+def is_interrogative(doc_or_span) -> bool:
     """
     Returns True if the sentence is an interrogative (question).
     Checks for:
     1. Trailing '?'.
     2. Subject-auxiliary inversion: AUX before nsubj for the ROOT verb.
     """
-    text = doc.text.strip()
+    text = doc_or_span.text.strip()
     if text.endswith('?'):
         return True
 
     # Find the root verb
     root = None
-    for token in doc:
+    for token in doc_or_span:
         if token.dep_ == 'ROOT':
             root = token
             break
@@ -282,12 +282,10 @@ def is_interrogative(doc) -> bool:
         return False
 
     # Check for auxiliary before subject
-    aux_before_subj = False
-    subj_after_aux = False
     aux_token = None
     subj_token = None
 
-    for token in doc:
+    for token in doc_or_span:
         if token.dep_ == 'aux' and token.head == root:
             aux_token = token
         if token.dep_ == 'nsubj' and token.head == root:
@@ -468,8 +466,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                      'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
 
-    # v13: mood detection using both syntax and punctuation
-    mood = 'interrogative' if is_interrogative(doc) else 'declarative'
+    # v14: mood detection per sentence (using pred_token.sent, not the full doc)
+    mood = 'interrogative' if is_interrogative(pred_token.sent) else 'declarative'
     polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
 
     return {
@@ -679,7 +677,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v13-interrogative <<<")
+    print(">>> RUNNING preprocess.py VERSION: v14-mood-per-sentence <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

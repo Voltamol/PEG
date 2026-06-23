@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v9 (provenance, refined roles)
-# VERSION MARKER: v9-provenance
+# preprocess.py — Graph‑PEG dataset generator, v10 (role correctness, confidence)
+# VERSION MARKER: v10-correctness
 
 import argparse
 import pickle
@@ -16,6 +16,42 @@ from sentence_transformers import SentenceTransformer
 # --------------------------------------------------------------------
 CONFIDENCE_FLOOR = 0.5
 EMBEDDING_POLICY = 'most_recent'
+
+# v10: source reliability multipliers
+SOURCE_RELIABILITY = {
+    'direct_nsubj': 1.0,
+    'direct_nsubjpass': 1.0,
+    'direct_dobj': 1.0,
+    'direct_iobj': 0.95,
+    'prep_pobj': 0.9,
+    'direct_advmod': 0.8,
+    'direct_comp': 0.85,
+    'subj_control': 0.7,
+    'obj_control': 0.65,
+    'conj_inherited': 0.6,
+    'relcl_inherited': 0.55,
+    'relcl_antecedent': 0.75,
+    'neg_flag': 1.0,          # polarity flags are exact
+}
+
+# v10: blacklist for ambiguous/placeholder fillers
+ENTITY_BLACKLIST = {
+    '_', 'which', 'what', 'that', 'who', 'whom', 'whose',
+    'where', 'when', 'why', 'how'
+}
+
+# v10: allowed POS tags per role (None means any)
+ROLE_POS_ALLOWED = {
+    'AGENT':     {'NOUN', 'PROPN', 'PRON'},
+    'PATIENT':   {'NOUN', 'PROPN', 'PRON'},
+    'RECIPIENT': {'NOUN', 'PROPN', 'PRON'},
+    'LOCATION':  {'NOUN', 'PROPN'},
+    'TIME':      {'NOUN', 'PROPN'},   # times can be proper nouns (e.g., "Sunday")
+    'MANNER':    {'ADV', 'NOUN'},     # adverbs or noun‑phrases (e.g., "with care")
+    'ATTRIBUTE': {'ADJ', 'NOUN', 'PROPN'},
+    'MODIFIER':  None,                # any, but will be refined later
+    'POLARITY':  None,                # flag, no entity
+}
 
 # --------------------------------------------------------------------
 # 2. ENTITY MERGING (string‑match only)
@@ -210,12 +246,36 @@ def find_predicate_tokens(doc):
     return predicates
 
 
+# v10: validation function
+def is_valid_filler(token, role):
+    """Check if a token is a plausible filler for the given role."""
+    # First, reject obvious non‑entity POS
+    if token.pos_ in {'VERB', 'AUX', 'PART', 'SCONJ', 'CCONJ', 'PUNCT', 'SYM'}:
+        return False
+
+    # For POLARITY, the filler is not a real entity, so always valid (handled separately)
+    if role == 'POLARITY':
+        return True
+
+    # Check POS against allowed list (if any)
+    allowed = ROLE_POS_ALLOWED.get(role)
+    if allowed is not None and token.pos_ not in allowed:
+        return False
+
+    # For concrete roles, reject blacklisted tokens
+    if role in {'AGENT', 'PATIENT', 'RECIPIENT', 'LOCATION', 'TIME'}:
+        if token.text.lower() in ENTITY_BLACKLIST:
+            return False
+
+    return True
+
+
 def extract_event_for_predicate(pred_token, sent_idx, doc):
     """
     Extracts one event, including provenance (source, origin token, dep).
     Returns a dict with:
       - event_type: str
-      - roles: list of dict with keys: role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight
+      - roles: list of dict with keys: role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight, confidence
       - metadata: dict
     """
     event_type = normalize_event_type(pred_token.lemma_)
@@ -224,18 +284,29 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
 
     roles = []
 
-    # Helper to add a role, tracking provenance
-    def add_role(role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight=1.0):
-        # Refine role if needed
-        refined = refine_role(event_type, role, origin_token_idx)  # we need the token object; we'll pass it later
+    # Helper to add a role, tracking provenance and validation
+    def add_role(role, entity_text, is_pronoun, source, origin_token, origin_dep, weight=1.0):
+        # v10: validate the filler
+        if not is_valid_filler(origin_token, role):
+            # Skip adding this role entirely (or we could add with very low confidence)
+            # For now, we skip to avoid pollution.
+            return
+
+        refined = refine_role(event_type, role, origin_token)
+        # v10: compute confidence from source reliability
+        reliability = SOURCE_RELIABILITY.get(source, 0.5)
+        confidence = weight * reliability
+
         roles.append({
             'role': refined,
             'entity_text': entity_text,
             'is_pronoun': is_pronoun,
             'source': source,
-            'origin_token_idx': origin_token_idx.i,  # token index in doc
+            'origin_token_idx': origin_token.i,
             'origin_dep': origin_dep,
             'weight': weight,
+            'confidence': confidence,
+            'reliability': reliability,
         })
 
     # Process direct children of the predicate
@@ -277,6 +348,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
                 'origin_token_idx': child.i,
                 'origin_dep': dep,
                 'weight': 1.0,
+                'confidence': 1.0,
+                'reliability': 1.0,
             })
 
     # ---- Subject inheritance for control/raising/relcl ----
@@ -292,19 +365,23 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             antecedent = matrix.text
             for r in roles:
                 if r['role'] == 'AGENT' and r['entity_text'].lower() in RELATIVE_PRONOUNS:
-                    # Replace with antecedent
-                    r['entity_text'] = antecedent
-                    r['is_pronoun'] = False
-                    r['source'] = 'relcl_antecedent'
-                    r['origin_token_idx'] = matrix.i
-                    r['origin_dep'] = matrix.dep_
+                    # Replace with antecedent, but also validate the antecedent token (matrix)
+                    if is_valid_filler(matrix, 'AGENT'):
+                        r['entity_text'] = antecedent
+                        r['is_pronoun'] = False
+                        r['source'] = 'relcl_antecedent'
+                        r['origin_token_idx'] = matrix.i
+                        r['origin_dep'] = matrix.dep_
+                        r['weight'] = 0.8
+                        r['reliability'] = SOURCE_RELIABILITY['relcl_antecedent']
+                        r['confidence'] = r['weight'] * r['reliability']
                     break
             else:
                 # No relative pronoun AGENT, so we might need to inherit
                 if not has_agent:
                     # Inherit from matrix subject
                     matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
-                    if matrix_subj:
+                    if matrix_subj and is_valid_filler(matrix_subj, 'AGENT'):
                         add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                                  'relcl_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
         else:
@@ -319,7 +396,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
                 else:
                     inherited = matrix_subj
                     source = 'subj_control'
-                if inherited is not None:
+                if inherited is not None and is_valid_filler(inherited, 'AGENT'):
                     add_role('AGENT', inherited.text, inherited.text.lower() in PRONOUNS,
                              source, inherited, inherited.dep_, weight=0.7)
 
@@ -327,7 +404,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
     if pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
         matrix = pred_token.head
         matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
-        if matrix_subj is not None:
+        if matrix_subj is not None and is_valid_filler(matrix_subj, 'AGENT'):
             add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                      'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
 
@@ -405,20 +482,20 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                         'role': r['role'],
                         'entity_id': None,
                         'mention_idx': None,
-                        'confidence': 1.0,
+                        'confidence': r.get('confidence', 1.0),
                         'source': r.get('source', 'unknown'),
                         'origin_token_idx': r.get('origin_token_idx', -1),
                         'origin_dep': r.get('origin_dep', ''),
                         'weight': r.get('weight', 1.0),
+                        'reliability': r.get('reliability', 1.0),
                     })
                     continue
 
                 eid, mention_idx = registry.resolve_or_create(
                     r['entity_text'], sent_idx, r['is_pronoun'])
 
-                # Confidence is derived from source and is_pronoun; we don't hardcode, but we store weight
-                # We'll set confidence = weight for now, but can be recomputed later.
-                confidence = r.get('weight', 0.5)
+                # Confidence already computed in add_role; store it
+                confidence = r.get('confidence', r.get('weight', 0.5))
                 if r['is_pronoun']:
                     unresolved.append({
                         'entity_id': eid, 'text': r['entity_text'],
@@ -435,6 +512,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                     'origin_token_idx': r.get('origin_token_idx', -1),
                     'origin_dep': r.get('origin_dep', ''),
                     'weight': r.get('weight', 1.0),
+                    'reliability': r.get('reliability', 1.0),
                 })
 
             all_events.append({
@@ -511,7 +589,7 @@ def run_self_checks(output, is_demo_corpus=True):
 
 
 # --------------------------------------------------------------------
-# 7. DUMP EVENTS
+# 7. DUMP EVENTS (updated to show confidence)
 # --------------------------------------------------------------------
 def dump_events(output):
     print("\n=== FULL EVENT DUMP ===")
@@ -522,10 +600,11 @@ def dump_events(output):
                 filler = '(flag)'
             else:
                 filler = output['entities'][r['entity_id']]['canonical_text']
-            # Show source and weight for debugging
+            # Show source, weight, and confidence
             src = r.get('source', '?')
             wt = r.get('weight', 1.0)
-            role_strs.append(f"{r['role']}={filler}(src={src},wt={wt:.2f})")
+            conf = r.get('confidence', wt)
+            role_strs.append(f"{r['role']}={filler}(src={src},wt={wt:.2f},conf={conf:.2f})")
         print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
               f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")
 
@@ -534,7 +613,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v9-provenance <<<")
+    print(">>> RUNNING preprocess.py VERSION: v10-correctness <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

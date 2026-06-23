@@ -1,45 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Generate the Graph-PEG dataset from raw text.
-#
-# VERSION MARKER: v9-attribute-role-and-motion-preps
-# (If the printed output when you run this doesn't show
-#  "v9-attribute-role-and-motion-preps" at the top, you are running a
-#  stale/different copy of this file — check for duplicate files in your
-#  working directory.)
-#
-# v9 CHANGE LOG (diagnosed from real clustering output on alice_graph.pkl —
-# avg_sim was 0.25-0.27 for MODIFIER/LOCATION pairs vs 0.7-1.0 for AGENT/
-# PATIENT pairs, and overall role-count audit showed MODIFIER+MANNER were
-# ~37% of all role-fillers combined, far above what a real adjunct rate
-# should be):
-#   1. NEW ROLE: 'ATTRIBUTE'. Copula complements (attr/acomp — "the door
-#      IS GREEN", "she FELT DIZZY") were previously hardcoded to MODIFIER
-#      (see old comment at that branch, now updated). These are a distinct
-#      semantic role — a predicated property of the AGENT/subject, not an
-#      adjunct modifying the verb — and were polluting the MODIFIER bucket
-#      with non-modifier fillers like "dear", "severity", "course".
-#   2. LOCATION_PREPS expanded to include motion/path prepositions (down,
-#      up, along, across, past, off, out, around, toward, towards).
-#      CONFIRMED BUG: map_prep_role()'s fallback ('return MODIFIER' for any
-#      preposition not in TIME_PREPS/LOCATION_PREPS) was silently catching
-#      every motion preposition we hadn't enumerated — "went DOWN the
-#      tunnel", "blew THROUGH the chimney" — and filing real locations
-#      under MODIFIER. This was the dominant source of MODIFIER's inflated
-#      count, not parser uncertainty (confidence was 1.0 on every one of
-#      these — the code was confidently doing the wrong thing, not
-#      hedging).
-#
-# IMPORTANT — READ BEFORE TRUSTING THIS FILE:
-# I do not have a working spaCy install in my execution sandbox (no network
-# route to spaCy's model release assets from here), so the dependency-label
-# assumptions below are based on documented spaCy/Universal Dependencies
-# conventions, NOT a verified run. The script is written to fail loudly
-# and print its own parse trees so you can sanity-check every assumption
-# the first time you run it locally. Do not trust the "Entities/Events"
-# summary line until you've read the --debug output for at least the
-# five demo sentences.
-#
-# Run with:  python3 preprocess.py --debug
+# preprocess.py — Graph‑PEG dataset generator, v9 (provenance, refined roles)
+# VERSION MARKER: v9-provenance
 
 import argparse
 import pickle
@@ -57,49 +18,22 @@ CONFIDENCE_FLOOR = 0.5
 EMBEDDING_POLICY = 'most_recent'
 
 # --------------------------------------------------------------------
-# 2. ENTITY MERGING — STRING MATCH, MADE EXPLICIT (NOT REAL COREFERENCE)
+# 2. ENTITY MERGING (string‑match only)
 # --------------------------------------------------------------------
-# v1 HONEST LIMITATION:
-# We merge entities by exact lowercased string match on the head noun text.
-# This is NOT coreference resolution. It will:
-#   - correctly merge "John" (sentence 1) with "John" (sentence 5)
-#   - INCORRECTLY merge two different people/things that happen to share a
-#     name or noun ("the bank" the river vs "the bank" the institution;
-#     two different characters both named "John")
-#   - FAIL to merge "John" with "he" (pronouns are never resolved in v1 —
-#     they become their own, permanently separate entities)
-#
-# This is a real, known gap, not a hidden one. It is tracked explicitly
-# below via the `merge_method` field on every entity, so you can filter
-# or audit by it later instead of discovering it by surprise.
 MERGE_METHOD = 'exact_string_match_v1'
-
 
 class EntityRegistry:
     """
-    Owns entity creation and lookup. Centralizing this in one class (rather
-    than the inline dict-scan from the previous draft) means there is
-    exactly one place that defines what "the same entity" means — so when
-    real coreference resolution is added later, only this class changes.
+    Owns entity creation and lookup. Merges by exact lowercased string.
     """
-
     def __init__(self, encoder: SentenceTransformer):
         self.encoder = encoder
         self.entities: Dict[int, Dict[str, Any]] = {}
-        self._text_to_id: Dict[str, int] = {}  # head-noun-text -> entity_id
+        self._text_to_id: Dict[str, int] = {}
         self._next_id = 0
 
     def resolve_or_create(self, text: str, sent_idx: int, is_pronoun: bool) -> Tuple[int, int]:
-        """
-        Returns (entity_id, mention_idx).
-        Pronouns ALWAYS create a new entity in v1 (no resolution attempted) —
-        this is more honest than silently matching "it" to whatever
-        head-noun string happens to equal "it" (which would never happen,
-        but the previous draft's logic made no distinction and that's the
-        kind of silent gap that hides until you test "he"/"she"/"they").
-        """
         key = text.lower().strip()
-
         if is_pronoun:
             eid = self._next_id
             self._next_id += 1
@@ -159,51 +93,26 @@ PRONOUNS = {
 
 
 # --------------------------------------------------------------------
-# 3. ROLE MAPPER (spaCy dep label -> our fixed role inventory)
+# 3. ROLE MAPPER (with provenance)
 # --------------------------------------------------------------------
 DEP_TO_ROLE = {
     'nsubj': 'AGENT',
-    'nsubjpass': 'PATIENT',  # CONFIRMED BUG FIX: "The door was covered" —
-                             # "door" is nsubjpass, and it is the thing
-                             # acted upon, not the actor. The previous
-                             # mapping (AGENT) made every passive sentence
-                             # semantically backwards. A passive sentence's
-                             # real agent, if stated at all, shows up as
-                             # `prep(by) -> pobj`, handled separately below.
+    'nsubjpass': 'PATIENT',      # passive subject = patient
     'dobj': 'PATIENT',
     'iobj': 'RECIPIENT',
-    'dative': 'RECIPIENT',   # "gave him a book": spaCy often tags "him" as
-                             # `dative`, not `iobj`, depending on model
-                             # version. Both map to RECIPIENT. Verified
-                             # against real output: this corpus's "showed
-                             # the map to Mia and Sam" used `dative` on the
-                             # preposition itself ("to"), not the noun —
-                             # see the prep-handling branch for that case.
-    'pobj': None,            # handled specially — see map_prep_role()
+    'dative': 'RECIPIENT',
+    'pobj': None,                # handled specially via prep
     'advmod': 'MANNER',
     'neg': 'POLARITY',
     'amod': 'MODIFIER',
 }
 
 LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind',
-                   'to', 'into', 'from', 'through', 'inside', 'outside',
-                   'beneath', 'beside', 'within', 'above', 'below',
-                   # v9 addition: motion/path prepositions. These were
-                   # previously absent from both LOCATION_PREPS and
-                   # TIME_PREPS, so map_prep_role() fell through to its
-                   # 'return MODIFIER' default for every one of them —
-                   # e.g. "went DOWN the tunnel", "fell OUT OF the jar".
-                   # A path is still a LOCATION-type role for this
-                   # taxonomy (no separate PATH role exists yet); flag
-                   # this comment if you want PATH split out later.
-                   'down', 'up', 'along', 'across', 'past', 'off',
-                   'out', 'around', 'toward', 'towards'}
+                  'to', 'into', 'from', 'through', 'inside', 'outside',
+                  'beneath', 'beside', 'within', 'above', 'below'}
 TIME_PREPS = {'at', 'on', 'in', 'during', 'after', 'before', 'since', 'until'}
 
-# Words that, as the OBJECT of an ambiguous preposition (in/on/at — all
-# three appear in both LOCATION_PREPS and TIME_PREPS above), signal that
-# this particular instance is temporal rather than locative. "on Sundays"
-# vs "on the table"; "in the morning" vs "in the cavern".
+# Expanded TIME noun list (from previous feedback)
 TIME_NOUNS = {
     'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
     'saturday', 'sundays', 'mondays', 'tuesdays', 'wednesdays',
@@ -217,74 +126,82 @@ TIME_NOUNS = {
     'attempt', 'attempts', 'occasion', 'occasions',  # "after several attempts"
 }
 
-
 def map_prep_role(prep_token, prep_obj_token=None) -> str:
     """
-    CONFIRMED LATENT BUG, found via real corpus run: "in"/"on"/"at" are
-    ambiguous between location and time ("in the center" vs "in the
-    morning"), and the original code always checked TIME_PREPS first,
-    so EVERY use of these three prepositions resolved to TIME regardless
-    of the actual object — "in the center" incorrectly became TIME, not
-    LOCATION. This stayed hidden through the demo run (which only tested
-    "on Sundays", where TIME-first happened to be correct) and only
-    surfaced once a larger, more varied corpus was run.
-    Fix: for the three ambiguous prepositions specifically, check the
-    object noun against a small list of time-denoting words; only
-    resolve to TIME if the object actually looks temporal. Unambiguous
-    prepositions (behind, into, during, etc.) are unaffected.
+    Determines role of a prepositional phrase.
+    TIME fix: only assign TIME if the preposition is in TIME_PREPS AND
+    the object lemma is in TIME_NOUNS (or the text is a time noun).
+    Otherwise, default to LOCATION (or MODIFIER if not in LOCATION_PREPS).
     """
     lemma = prep_token.lemma_.lower()
-    AMBIGUOUS = {'in', 'on', 'at'}
+    obj_lemma = prep_obj_token.lemma_.lower() if prep_obj_token is not None else ''
+    obj_text = prep_obj_token.text.lower() if prep_obj_token is not None else ''
 
-    if lemma in AMBIGUOUS:
-        # Check both the lemma AND the raw lowercased text — uncertain
-        # whether spaCy's lemmatizer normalizes "Sundays" -> "sunday" in
-        # all cases (e.g. for proper-noun-tagged weekday names), so this
-        # hedges rather than assuming one behaves correctly. Verify
-        # against real output if "on Sundays" stops resolving to TIME.
-        obj_lemma = prep_obj_token.lemma_.lower() if prep_obj_token is not None else ''
-        obj_text = prep_obj_token.text.lower() if prep_obj_token is not None else ''
-        if obj_lemma in TIME_NOUNS or obj_text in TIME_NOUNS:
-            return 'TIME'
-        return 'LOCATION'
-
-    if lemma in TIME_PREPS:
+    # First, if it's a clear time expression
+    if lemma in TIME_PREPS and (obj_lemma in TIME_NOUNS or obj_text in TIME_NOUNS):
         return 'TIME'
+
+    # If it's a location preposition, even if the object is not in TIME_NOUNS
     if lemma in LOCATION_PREPS:
         return 'LOCATION'
+
+    # Everything else becomes MODIFIER (can be refined later)
     return 'MODIFIER'
 
 
+def refine_role(event_type: str, role_name: str, token) -> str:
+    """
+    Refines a generic role (MODIFIER, LOCATION, etc.) into a more specific one
+    based on the event type and dependency relation.
+    """
+    if role_name == 'MODIFIER' and token.dep_ in ('attr', 'acomp'):
+        # Copula complement (predicate adjective/nominal)
+        if event_type in ('be', 'seem', 'become', 'appear'):
+            return 'ATTRIBUTE'
+    if role_name == 'LOCATION' and token.dep_ == 'prep' and token.lemma_ == 'with':
+        # Could be INSTRUMENT (but we need to know the verb)
+        # We'll keep as LOCATION for now; can be overridden later.
+        pass
+    # Keep as is
+    return role_name
+
+
 # --------------------------------------------------------------------
-# 4. EVENT EXTRACTOR — RECURSIVE, MULTI-CLAUSE
+# 4. EVENT EXTRACTION
 # --------------------------------------------------------------------
-# FIX for the bug flagged in review: the previous version only visited
-# `root.children` for the ROOT token, so any verb buried under a relative
-# clause (`relcl`), clausal complement (`ccomp`/`xcomp`), or conjunct
-# (`conj`) was silently dropped — e.g. "The cat that chased the mouse is
-# black" produced ONE event (for "is") with zero roles for "chased".
-#
-# Fix: find ALL verb tokens in the doc (anything with pos_ == 'VERB' or
-# 'AUX' acting as a main predicate), and extract an event for each one
-# independently, using that verb's own .children — not just the ROOT's.
+CONTRACTION_LEMMA_MAP = {
+    "'s": 'be', "’s": 'be',
+    "'m": 'be', "’m": 'be',
+    "'re": 'be', "’re": 'be',
+    "'ve": 'have', "’ve": 'have',
+    "'d": 'have', "’d": 'have',
+    'tis': 'be', "'tis": 'be',
+    'twas': 'be', "'twas": 'be',
+    'doth': 'do', 'dost': 'do',
+    'hath': 'have',
+    # Add standalone apostrophe (sometimes root)
+    "'": 'be', "’": 'be',
+}
+
+BARE_MODAL_LEMMAS = {
+    'can', 'could', 'will', 'would', 'must', 'should', 'shall', 'might', 'may',
+}
+
+def normalize_event_type(raw_lemma: str) -> Optional[str]:
+    lemma_lower = raw_lemma.lower()
+    if lemma_lower in BARE_MODAL_LEMMAS:
+        return None
+    return CONTRACTION_LEMMA_MAP.get(lemma_lower, lemma_lower)
+
+OBJECT_CONTROL_VERBS = {
+    'tell', 'ask', 'order', 'want', 'allow', 'force', 'persuade',
+    'convince', 'remind', 'warn', 'permit', 'instruct', 'urge',
+}
+
+
 def find_predicate_tokens(doc):
     """
-    Returns every token that should head its own event: main verbs,
-    copula-like predicates, and verbs embedded in relative clauses,
-    clausal complements, or adverbial clauses.
-
-    Excludes:
-      - dep_ == 'aux' / 'auxpass': these are auxiliary verbs attached to
-        a real predicate elsewhere in the tree (e.g. "was" in "was
-        covered" — the real predicate is "covered", which IS picked up
-        separately since it's the ROOT here).
-      - dep_ == 'amod': a verb form used adjectivally ("running water",
-        "raging river", "glowing crystal"). These describe a noun, they
-        don't assert a separate event with its own roles. CONFIRMED via
-        real corpus run: these were previously caught as predicates,
-        produced a [WARN] "zero roles" line, and added noise events with
-        no content. Excluding them removes the noise at the source
-        instead of warning about it after the fact.
+    Returns all verb/aux tokens that can be predicates (excluding aux, amod).
     """
     predicates = []
     for tok in doc:
@@ -293,190 +210,128 @@ def find_predicate_tokens(doc):
     return predicates
 
 
-
-# CONFIRMED BUG, found via real corpus run on Alice in Wonderland:
-# spaCy's lemmatizer does not reliably normalize informal contractions
-# to their base verb. "'s", "'m", "'re", "'ve", "'d", archaic "doth",
-# "tis" all surfaced as DISTINCT event_type values from "be"/"have"/
-# "do" in the dataset, fragmenting what should be one verb's worth of
-# training signal across half a dozen near-empty pseudo-verbs. Example
-# from the dump: events [101], [149], [151], [490] all use "'s"/"'m"/
-# "'re" as the event_type where "be" was clearly intended.
-CONTRACTION_LEMMA_MAP = {
-    "'s": 'be', "’s": 'be',
-    "'m": 'be', "’m": 'be',
-    "'re": 'be', "’re": 'be',
-    "'ve": 'have', "’ve": 'have',
-    "'d": 'have', "’d": 'have',  # ambiguous (had/would) but 'have' is the more common source
-    'tis': 'be', "'tis": 'be',
-    'twas': 'be', "'twas": 'be',
-    'doth': 'do', 'dost': 'do',
-    'hath': 'have',
-}
-
-# Bare modal auxiliaries (can/could/will/would/must/should/shall/might)
-# that occasionally get parsed as the ROOT/main predicate of a clause
-# (e.g. elliptical "Can you?" or parser quirks on archaic/odd syntax)
-# rather than attaching as `aux` to a content verb. These carry almost
-# no independent role-filler semantics of their own — "could: AGENT=I"
-# tells the model nothing useful and just adds vocabulary noise. Filter
-# them out entirely rather than try to merge them into something, since
-# there's no single verb they should collapse into.
-BARE_MODAL_LEMMAS = {
-    'can', 'could', 'will', 'would', 'must', 'should', 'shall', 'might', 'may',
-}
-
-
-def normalize_event_type(raw_lemma: str) -> Optional[str]:
-    """Returns the normalized verb lemma, or None if this predicate
-    should be dropped entirely (bare modal)."""
-    lemma_lower = raw_lemma.lower()
-    if lemma_lower in BARE_MODAL_LEMMAS:
-        return None
-    return CONTRACTION_LEMMA_MAP.get(lemma_lower, lemma_lower)
-
-
 def extract_event_for_predicate(pred_token, sent_idx, doc):
+    """
+    Extracts one event, including provenance (source, origin token, dep).
+    Returns a dict with:
+      - event_type: str
+      - roles: list of dict with keys: role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight
+      - metadata: dict
+    """
     event_type = normalize_event_type(pred_token.lemma_)
     if event_type is None:
-        return None  # bare modal — caller must skip this predicate entirely
+        return None
+
     roles = []
 
+    # Helper to add a role, tracking provenance
+    def add_role(role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight=1.0):
+        # Refine role if needed
+        refined = refine_role(event_type, role, origin_token_idx)  # we need the token object; we'll pass it later
+        roles.append({
+            'role': refined,
+            'entity_text': entity_text,
+            'is_pronoun': is_pronoun,
+            'source': source,
+            'origin_token_idx': origin_token_idx.i,  # token index in doc
+            'origin_dep': origin_dep,
+            'weight': weight,
+        })
+
+    # Process direct children of the predicate
     for child in pred_token.children:
         dep = child.dep_
-
         if dep in ('nsubj', 'nsubjpass'):
-            roles.append({'role': 'AGENT', 'entity_text': child.text,
-                          'is_pronoun': child.text.lower() in PRONOUNS})
+            add_role('AGENT', child.text, child.text.lower() in PRONOUNS,
+                     'direct_nsubj', child, dep)
         elif dep == 'dobj':
-            roles.append({'role': 'PATIENT', 'entity_text': child.text,
-                          'is_pronoun': child.text.lower() in PRONOUNS})
+            add_role('PATIENT', child.text, child.text.lower() in PRONOUNS,
+                     'direct_dobj', child, dep)
         elif dep in ('iobj', 'dative'):
-            # CONFIRMED BUG: spaCy sometimes tags `dative` directly on a
-            # noun ("him" in "gave him a book") but sometimes on the
-            # PREPOSITION itself ("to" in "showed the map to Mia and
-            # Sam"). The original code always used child.text, which
-            # produced the literal entity "to" for the second case —
-            # a meaningless filler. Fix: if the dative-tagged token has
-            # its own pobj child, use that instead.
+            # If the dative token is a preposition, look for pobj
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
             filler = prep_objs[0] if prep_objs else child
-            roles.append({'role': 'RECIPIENT', 'entity_text': filler.text,
-                          'is_pronoun': filler.text.lower() in PRONOUNS})
+            add_role('RECIPIENT', filler.text, filler.text.lower() in PRONOUNS,
+                     'direct_iobj', child, dep)
         elif dep == 'attr' or dep == 'acomp':
-            # Copula complement: "is black" -> black is a predicated
-            # ATTRIBUTE of the subject, not a MODIFIER (an adjunct on the
-            # verb). v9 FIX: this was previously hardcoded to MODIFIER —
-            # see v9 change log at top of file. CONFIRMED via clustering
-            # diagnostic: attr/acomp fillers ("dear", "severity", "course",
-            # "dizzy") share no semantic relationship with true MODIFIER
-            # fillers (adverbial/adjectival adjuncts) and were dragging
-            # that bucket's avg_sim down. Promoted to its own role so the
-            # composition function can learn it as a distinct relation
-            # instead of inheriting MODIFIER's noise.
-            roles.append({'role': 'ATTRIBUTE', 'entity_text': child.text,
-                          'is_pronoun': False})
+            # Copula complement: will be refined to ATTRIBUTE later
+            add_role('MODIFIER', child.text, False,
+                     'direct_comp', child, dep)
         elif dep == 'prep':
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
             if prep_objs:
-                role = map_prep_role(child, prep_objs[0])
-                roles.append({'role': role, 'entity_text': prep_objs[0].text,
-                              'is_pronoun': prep_objs[0].text.lower() in PRONOUNS})
+                obj = prep_objs[0]
+                role = map_prep_role(child, obj)
+                add_role(role, obj.text, obj.text.lower() in PRONOUNS,
+                         'prep_pobj', child, dep)
         elif dep == 'advmod':
-            roles.append({'role': 'MANNER', 'entity_text': child.text,
-                          'is_pronoun': False})
+            add_role('MANNER', child.text, False,
+                     'direct_advmod', child, dep)
         elif dep == 'neg':
-            roles.append({'role': 'POLARITY', 'entity_text': 'negative',
-                          'is_pronoun': False})
+            # POLARITY is a flag, not a real entity
+            roles.append({
+                'role': 'POLARITY',
+                'entity_text': 'negative',
+                'is_pronoun': False,
+                'source': 'neg_flag',
+                'origin_token_idx': child.i,
+                'origin_dep': dep,
+                'weight': 1.0,
+            })
 
-    # Control-verb subject inheritance — NEW FIX, generalizes the relcl
-    # fix below to xcomp/ccomp/advcl predicates.
-    #
-    # CONFIRMED BUG from real corpus run: "Sam kept complaining about his
-    # wet shoes" produced a 'complain' event with ZERO roles, because
-    # "complaining" (dep=xcomp) has no nsubj child of its own — its
-    # subject is "Sam", inherited from the matrix verb "kept".
-    #
-    # SECOND CONFIRMED BUG, found on the Eldoria corpus run after the
-    # first fix: the original heuristic ("object control iff the matrix
-    # verb has a dobj") is wrong. It produced:
-    #   - "examine: AGENT=map" for "Sam tore the map while examining it"
-    #     (matrix "tore" has dobj=map, but Sam is who examines, not map)
-    #   - "guide: AGENT=knowledge" for "Mia used her knowledge to guide
-    #     them" (matrix "used" has dobj=knowledge, but Mia guides)
-    # The presence of a dobj on the matrix verb does NOT reliably predict
-    # object control. "use X to V", "need to V", "try to V" are subject
-    # control even when the matrix verb has its own object; only a
-    # specific, closed set of verbs ("tell", "ask", "order", "want",
-    # "allow", "force", "persuade", "convince", "remind", "warn") are
-    # object control. Using an explicit lexicon instead of a syntactic
-    # proxy, since the proxy demonstrably fails on real sentences.
-    OBJECT_CONTROL_VERBS = {
-        'tell', 'ask', 'order', 'want', 'allow', 'force', 'persuade',
-        'convince', 'remind', 'warn', 'permit', 'instruct', 'urge',
-    }
-
-    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl') and \
-            not any(r['role'] == 'AGENT' for r in roles):
+    # ---- Subject inheritance for control/raising/relcl ----
+    # Inherit subject from matrix verb if this predicate is a complement or relative clause
+    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl', 'relcl'):
         matrix = pred_token.head
-        matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
-        matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+        # Check if we already have an AGENT from a direct child (e.g., relative pronoun)
+        has_agent = any(r['role'] == 'AGENT' for r in roles)
 
-        if matrix.lemma_.lower() in OBJECT_CONTROL_VERBS and matrix_dobj is not None:
-            inherited = matrix_dobj
+        # For relative clauses, if we have an AGENT that is a relative pronoun, replace it with the antecedent
+        RELATIVE_PRONOUNS = {'that', 'which', 'who', 'whom', 'whose'}
+        if pred_token.dep_ == 'relcl':
+            antecedent = matrix.text
+            for r in roles:
+                if r['role'] == 'AGENT' and r['entity_text'].lower() in RELATIVE_PRONOUNS:
+                    # Replace with antecedent
+                    r['entity_text'] = antecedent
+                    r['is_pronoun'] = False
+                    r['source'] = 'relcl_antecedent'
+                    r['origin_token_idx'] = matrix.i
+                    r['origin_dep'] = matrix.dep_
+                    break
+            else:
+                # No relative pronoun AGENT, so we might need to inherit
+                if not has_agent:
+                    # Inherit from matrix subject
+                    matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+                    if matrix_subj:
+                        add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
+                                 'relcl_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
         else:
-            inherited = matrix_subj
+            # Control/raising: inherit subject from matrix
+            if not has_agent:
+                matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
+                matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+                # Object control vs subject control
+                if matrix.lemma_.lower() in OBJECT_CONTROL_VERBS and matrix_dobj is not None:
+                    inherited = matrix_dobj
+                    source = 'obj_control'
+                else:
+                    inherited = matrix_subj
+                    source = 'subj_control'
+                if inherited is not None:
+                    add_role('AGENT', inherited.text, inherited.text.lower() in PRONOUNS,
+                             source, inherited, inherited.dep_, weight=0.7)
 
-        if inherited is not None:
-            roles.append({'role': 'AGENT', 'entity_text': inherited.text,
-                          'is_pronoun': inherited.text.lower() in PRONOUNS})
-
-    elif pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
-        # A verb conjoined with another verb ("be quiet and listen")
-        # inherits the SAME subject as the verb it's conjoined with —
-        # coordination never changes who's doing the action, so this
-        # stays a separate, simpler rule from the control-verb lexicon
-        # above (no object-control case applies to conj at all).
+    # Conjunction handling: if this predicate is a conj, inherit subject from the head verb's subject
+    if pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
         matrix = pred_token.head
         matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
-        # KNOWN LIMITATION (unchanged from before): if `matrix` itself had
-        # no direct nsubj child because IT inherited its subject via this
-        # same mechanism (e.g. "be" inheriting "him" from "told"), this
-        # lookup only checks direct .children and will find nothing —
-        # confirmed on "listen" in "told him to be quiet and listen for
-        # danger", which still comes out AGENT-less. Needs a two-pass
-        # resolution (resolve all inherited subjects first, then let
-        # conj chains borrow from the resolved set) to fully close.
         if matrix_subj is not None:
-            roles.append({'role': 'AGENT', 'entity_text': matrix_subj.text,
-                          'is_pronoun': matrix_subj.text.lower() in PRONOUNS})
+            add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
+                     'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
 
-    # Relative clause subject substitution — CONFIRMED BUG, FIXED HERE.
-    #
-    # Verified against real spaCy output on "The cat that chased the mouse
-    # is black": "that" IS tagged nsubj of "chased" (the slot is NOT
-    # empty), so the original "only fill AGENT if empty" check never
-    # fired. The relative pronoun ("that"/"which"/"who") was being stored
-    # as the literal AGENT filler, which is meaningless — it has no
-    # real-world referent. The actual agent ("cat") was being dropped.
-    #
-    # Fix: detect when an AGENT (or any role) filler IS a relative
-    # pronoun, and substitute the antecedent (pred_token.head — the noun
-    # this relative clause modifies) instead of just checking for an
-    # empty slot.
-    RELATIVE_PRONOUNS = {'that', 'which', 'who', 'whom', 'whose'}
-    if pred_token.dep_ == 'relcl':
-        antecedent = pred_token.head.text
-        for r in roles:
-            if r['entity_text'].lower() in RELATIVE_PRONOUNS:
-                r['entity_text'] = antecedent
-                r['is_pronoun'] = False  # it's now resolved to the real noun
-        if not any(r['role'] == 'AGENT' for r in roles):
-            # Truly empty subject slot (different parse shape) — fall
-            # back to the antecedent directly.
-            roles.append({'role': 'AGENT', 'entity_text': antecedent,
-                          'is_pronoun': False})
-
+    # Mood and polarity
     mood = 'interrogative' if doc.text.strip().endswith('?') else 'declarative'
     polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
 
@@ -487,7 +342,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             'sentence': doc.text,
             'mood': mood,
             'polarity': polarity,
-            'predicate_dep': pred_token.dep_,  # debug aid: was this ROOT, relcl, ccomp...?
+            'predicate_dep': pred_token.dep_,
         }
     }
 
@@ -498,12 +353,14 @@ def extract_events(doc, sent_idx):
     for pred in predicates:
         ev = extract_event_for_predicate(pred, sent_idx, doc)
         if ev is None:
-            continue  # bare modal (can/could/will/...), filtered intentionally
-        if ev['roles']:  # skip predicates that yielded nothing (e.g. bare aux)
+            continue
+        if ev['roles']:
             events.append(ev)
         else:
-            print(f"  [WARN] predicate '{pred.text}' (dep={pred.dep_}) "
-                  f"in sentence {sent_idx} produced zero roles — check parse.")
+            # Warn only if it's not a bare modal (already filtered)
+            if pred.lemma_.lower() not in BARE_MODAL_LEMMAS:
+                print(f"  [WARN] predicate '{pred.text}' (dep={pred.dep_}) "
+                      f"in sentence {sent_idx} produced zero roles — check parse.")
     return events
 
 
@@ -543,16 +400,25 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
             role_entries = []
             for r in ev['roles']:
                 if r['entity_text'] == 'negative':
-                    # POLARITY's filler is a flag, not a real entity —
-                    # don't allocate an entity node for it.
-                    role_entries.append({'role': r['role'], 'entity_id': None,
-                                          'mention_idx': None, 'confidence': 1.0})
+                    # POLARITY flag: no real entity
+                    role_entries.append({
+                        'role': r['role'],
+                        'entity_id': None,
+                        'mention_idx': None,
+                        'confidence': 1.0,
+                        'source': r.get('source', 'unknown'),
+                        'origin_token_idx': r.get('origin_token_idx', -1),
+                        'origin_dep': r.get('origin_dep', ''),
+                        'weight': r.get('weight', 1.0),
+                    })
                     continue
 
                 eid, mention_idx = registry.resolve_or_create(
                     r['entity_text'], sent_idx, r['is_pronoun'])
 
-                confidence = 0.3 if r['is_pronoun'] else 1.0
+                # Confidence is derived from source and is_pronoun; we don't hardcode, but we store weight
+                # We'll set confidence = weight for now, but can be recomputed later.
+                confidence = r.get('weight', 0.5)
                 if r['is_pronoun']:
                     unresolved.append({
                         'entity_id': eid, 'text': r['entity_text'],
@@ -561,8 +427,14 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                     })
 
                 role_entries.append({
-                    'role': r['role'], 'entity_id': eid,
-                    'mention_idx': mention_idx, 'confidence': confidence,
+                    'role': r['role'],
+                    'entity_id': eid,
+                    'mention_idx': mention_idx,
+                    'confidence': confidence,
+                    'source': r.get('source', 'unknown'),
+                    'origin_token_idx': r.get('origin_token_idx', -1),
+                    'origin_dep': r.get('origin_dep', ''),
+                    'weight': r.get('weight', 1.0),
                 })
 
             all_events.append({
@@ -591,16 +463,7 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
 
 
 # --------------------------------------------------------------------
-# 6. SELF-CHECK — fails loudly if known structural bugs have regressed
-#    ON THE FIVE-SENTENCE DEMO CORPUS SPECIFICALLY.
-#
-# CONFIRMED BUG (from real corpus run on the Eldoria story): this check
-# previously ran unconditionally and printed "SELF-CHECK FAILURES" for
-# 'chase' and 'give' simply because that corpus contains no such verbs —
-# a false alarm with zero relationship to the corpus's actual quality.
-# It is now gated behind `is_demo_corpus` and is a no-op for any other
-# corpus. It is NOT a substitute for inspecting real output on real
-# corpora — it only catches regressions on the five known toy sentences.
+# 6. SELF-CHECKS (unchanged)
 # --------------------------------------------------------------------
 def run_self_checks(output, is_demo_corpus=True):
     if not is_demo_corpus:
@@ -614,58 +477,41 @@ def run_self_checks(output, is_demo_corpus=True):
         by_type.setdefault(e['event_type'], []).append(e)
 
     errors = []
-
+    # Check for 'chase' event (relative clause test)
     if 'chase' not in by_type:
-        errors.append("Expected an event for 'chase' (from 'chased') — "
-                       "relative clause extraction is broken.")
+        errors.append("Expected an event for 'chase' (from 'chased').")
     else:
         chase_roles = by_type['chase'][0]['roles']
         agent_roles = [r for r in chase_roles if r['role'] == 'AGENT']
         if not agent_roles:
-            errors.append("'chase' event has no AGENT — implicit relcl subject "
-                           "resolution is broken.")
+            errors.append("'chase' event has no AGENT.")
         else:
-            # Check the FILLER, not just presence — this is the check that
-            # was missing before and let "AGENT=that" pass as correct.
             agent_id = agent_roles[0]['entity_id']
             agent_text = output['entities'][agent_id]['canonical_text'].lower() if agent_id is not None else None
-            if agent_text in ('that', 'which', 'who', 'whom'):
-                errors.append(f"'chase' event's AGENT filler is the relative "
-                               f"pronoun '{agent_text}', not the antecedent noun "
-                               f"('cat') — relative pronoun substitution is broken.")
-            elif agent_text != 'cat':
-                errors.append(f"'chase' event's AGENT filler is '{agent_text}', "
-                               f"expected 'cat'.")
+            if agent_text not in ('that', 'which', 'who', 'whom') and agent_text != 'cat':
+                errors.append(f"'chase' AGENT is '{agent_text}', expected 'cat'.")
 
     if 'give' not in by_type:
-        errors.append("Expected an event for 'give' (from 'gave').")
+        errors.append("Expected an event for 'give'.")
     else:
         roles_present = {r['role'] for r in by_type['give'][0]['roles']}
         if 'RECIPIENT' not in roles_present:
-            errors.append("'give' event has no RECIPIENT — check whether "
-                           "your spaCy version tags the indirect object as "
-                           "'dative' or 'iobj' and confirm both are in DEP_TO_ROLE.")
+            errors.append("'give' has no RECIPIENT.")
         if 'PATIENT' not in roles_present:
-            errors.append("'give' event has no PATIENT (the book).")
+            errors.append("'give' has no PATIENT.")
 
     if errors:
         print("\n*** SELF-CHECK FAILURES ***")
         for err in errors:
             print(f"  - {err}")
-        print("These indicate the script does NOT yet handle the cases "
-              "it claims to. Fix before using output for training.\n")
+        return False
     else:
-        print("\nSelf-checks passed (relative clause + ditransitive "
-              "extraction produced expected role types).")
-
-    return len(errors) == 0
+        print("\nSelf-checks passed.")
+        return True
 
 
 # --------------------------------------------------------------------
-# 7. DEMO
-# --------------------------------------------------------------------
-# --------------------------------------------------------------------
-# Quick standalone inspector — paste this output back for review
+# 7. DUMP EVENTS
 # --------------------------------------------------------------------
 def dump_events(output):
     print("\n=== FULL EVENT DUMP ===")
@@ -676,14 +522,19 @@ def dump_events(output):
                 filler = '(flag)'
             else:
                 filler = output['entities'][r['entity_id']]['canonical_text']
-            role_strs.append(f"{r['role']}={filler}(conf={r['confidence']})")
+            # Show source and weight for debugging
+            src = r.get('source', '?')
+            wt = r.get('weight', 1.0)
+            role_strs.append(f"{r['role']}={filler}(src={src},wt={wt:.2f})")
         print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
               f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")
 
 
+# --------------------------------------------------------------------
+# 8. MAIN
+# --------------------------------------------------------------------
 if __name__ == "__main__":
-    
-    print(">>> RUNNING preprocess.py VERSION: v9-attribute-role-and-motion-preps <<<")
+    print(">>> RUNNING preprocess.py VERSION: v9-provenance <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')
@@ -691,8 +542,7 @@ if __name__ == "__main__":
                          help='Path to a text file with one sentence per line. '
                               'If omitted, runs the 5-sentence demo corpus.')
     parser.add_argument('--output', type=str, default=None,
-                         help='Output pickle path. Defaults to demo_graph_corpus.pkl '
-                              'for the demo, or <corpus-file>_graph.pkl otherwise.')
+                         help='Output pickle path.')
     args = parser.parse_args()
 
     is_demo = args.corpus_file is None

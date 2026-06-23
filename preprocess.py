@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v16 (local negation)
-# VERSION MARKER: v16-local-negation
+# preprocess.py — Graph‑PEG dataset generator, v17 (probabilistic coref)
+# VERSION MARKER: v17-prob-coref
 
 import argparse
 import pickle
@@ -61,38 +61,271 @@ ROLE_POS_ALLOWED = {
 }
 
 # --------------------------------------------------------------------
-# 2. ENTITY MERGING (string‑match only)
+# 2a. PRONOUN METADATA AND COREF RESOLVER
+# --------------------------------------------------------------------
+# Pronoun attribute table: (gender, number)
+PRONOUN_ATTRS = {
+    'he': ('MASC', 'SING'), 'him': ('MASC', 'SING'), 'his': ('MASC', 'SING'),
+    'himself': ('MASC', 'SING'),
+    'she': ('FEM', 'SING'), 'her': ('FEM', 'SING'), 'hers': ('FEM', 'SING'),
+    'herself': ('FEM', 'SING'),
+    'it': ('NEUT', 'SING'), 'its': ('NEUT', 'SING'), 'itself': ('NEUT', 'SING'),
+    'they': ('PLUR', 'PLUR'), 'them': ('PLUR', 'PLUR'), 'their': ('PLUR', 'PLUR'),
+    'theirs': ('PLUR', 'PLUR'), 'themselves': ('PLUR', 'PLUR'),
+    'i': ('1ST', 'SING'), 'me': ('1ST', 'SING'), 'my': ('1ST', 'SING'),
+    'mine': ('1ST', 'SING'), 'myself': ('1ST', 'SING'),
+    'you': ('2ND', 'ANY'), 'your': ('2ND', 'ANY'), 'yours': ('2ND', 'ANY'),
+    'yourself': ('2ND', 'SING'),
+    'we': ('1ST', 'PLUR'), 'us': ('1ST', 'PLUR'), 'our': ('1ST', 'PLUR'),
+    'ours': ('1ST', 'PLUR'), 'ourselves': ('1ST', 'PLUR'),
+}
+
+# Interrogative pronouns — never resolve these in narrative
+INTERROGATIVE_PRONOUNS = {'who', 'whom', 'whose', 'what', 'which', 'where', 'when', 'why', 'how'}
+
+# Small proper-noun gender dictionary (extend as needed)
+PROPER_NOUN_GENDER = {
+    'alice': 'FEM', 'queen': 'FEM', 'duchess': 'FEM', 'mary': 'FEM',
+    'john': 'MASC', 'rabbit': 'MASC', 'king': 'MASC', 'hatter': 'MASC',
+    'cat': 'MASC', 'mouse': 'MASC', 'bill': 'MASC',
+}
+
+# Feature weights — hand-tuned starting point.
+# Can later be learned from labeled data via logistic regression.
+FEATURE_WEIGHTS = {
+    'recency':        2.5,   # exponential decay over sentence distance
+    'parallelism':    3.0,   # same grammatical role (esp. subject↔subject)
+    'salience':       1.0,   # log(mention_count)
+    'subject_bias':   1.5,   # fraction of mentions as subject
+    'semantic':       2.0,   # cosine similarity to local context
+    'first_mention':  0.3,   # bonus for being introduced early (protagonist bias)
+}
+
+COREF_THRESHOLD = 0.55   # minimum P(best candidate) to commit a link
+
+
+class CorefResolver:
+    """
+    Maintains a discourse model of entities and resolves pronouns
+    by computing P(e_k | pronoun, context) via a log-linear model.
+    """
+
+    def __init__(self, encoder):
+        self.encoder = encoder
+        # candidate pool: list of dicts, one per entity bucket
+        self.candidates = []
+        self._eid_to_idx = {}
+
+    # ---------- attribute inference ----------
+    def pronoun_attrs(self, text: str):
+        return PRONOUN_ATTRS.get(text.lower(), ('UNKNOWN', 'UNKNOWN'))
+
+    def infer_entity_attrs(self, token):
+        """Infer (gender, number) from a spaCy token."""
+        # Number
+        number = 'UNKNOWN'
+        morph_num = token.morph.get("Number")
+        if morph_num:
+            number = 'PLUR' if 'Plur' in morph_num else 'SING'
+        elif token.text.lower().endswith('s') and not token.text.lower().endswith('ss'):
+            number = 'PLUR'
+
+        # Gender
+        gender = 'UNKNOWN'
+        morph_gen = token.morph.get("Gender")
+        if morph_gen:
+            if 'Masc' in morph_gen: gender = 'MASC'
+            elif 'Fem' in morph_gen: gender = 'FEM'
+            elif 'Neut' in morph_gen: gender = 'NEUT'
+        elif token.pos_ == 'PROPN':
+            gender = PROPER_NOUN_GENDER.get(token.text.lower(), 'UNKNOWN')
+        return gender, number
+
+    # ---------- candidate management ----------
+    def register_entity(self, eid: int, text: str, sent_idx: int, dep: str,
+                        gender: str, number: str, embedding, token):
+        """Add a new non-pronoun entity to the candidate pool."""
+        if eid in self._eid_to_idx:
+            # update existing candidate's state
+            cand = self.candidates[self._eid_to_idx[eid]]
+            cand['last_seen_sent'] = sent_idx
+            cand['mention_count'] += 1
+            cand['last_dep'] = dep
+            if dep in ('nsubj', 'nsubjpass'):
+                cand['subject_count'] += 1
+            cand['embedding'] = embedding  # refresh to most recent
+            cand['last_token'] = token
+        else:
+            idx = len(self.candidates)
+            self._eid_to_idx[eid] = idx
+            self.candidates.append({
+                'eid': eid,
+                'text': text,
+                'first_seen_sent': sent_idx,
+                'last_seen_sent': sent_idx,
+                'mention_count': 1,
+                'subject_count': 1 if dep in ('nsubj', 'nsubjpass') else 0,
+                'last_dep': dep,
+                'gender': gender,
+                'number': number,
+                'embedding': embedding,
+                'last_token': token,
+            })
+
+    # ---------- feature functions ----------
+    def _f_recency(self, cand, sent_idx):
+        """Exponential decay: 1.0 if just mentioned, → 0 as distance grows."""
+        dist = sent_idx - cand['last_seen_sent']
+        if dist < 0: return 0.0
+        import math
+        return math.exp(-0.4 * dist)
+
+    def _f_parallelism(self, cand, pronoun_dep):
+        """Bonus if pronoun and candidate share grammatical role.
+        Subject↔subject gets the biggest bonus (Centering Theory)."""
+        cand_dep = cand['last_dep']
+        if pronoun_dep == cand_dep:
+            return 1.0
+        subj_set = {'nsubj', 'nsubjpass'}
+        if pronoun_dep in subj_set and cand_dep in subj_set:
+            return 1.0
+        obj_set = {'dobj', 'pobj', 'iobj', 'dative'}
+        if pronoun_dep in obj_set and cand_dep in obj_set:
+            return 0.6
+        return 0.0
+
+    def _f_salience(self, cand):
+        import math
+        return math.log1p(cand['mention_count'])
+
+    def _f_subject_bias(self, cand):
+        if cand['mention_count'] == 0: return 0.0
+        return cand['subject_count'] / cand['mention_count']
+
+    def _f_semantic(self, cand, context_embedding):
+        """Cosine similarity between entity embedding and local sentence."""
+        if context_embedding is None or cand['embedding'] is None:
+            return 0.0
+        from sentence_transformers import util
+        return float(util.cos_sim(cand['embedding'], context_embedding)[0][0])
+
+    def _f_first_mention(self, cand, sent_idx):
+        """Entities introduced early in the text are often protagonists."""
+        if sent_idx == 0: return 0.0
+        return 1.0 / (1.0 + cand['first_seen_sent'])
+
+    # ---------- the inference ----------
+    def resolve(self, pronoun_text: str, pronoun_dep: str,
+                sent_idx: int, context_embedding=None):
+        """
+        Returns (best_eid, probability) or (None, 0.0) if no good candidate.
+        """
+        # Never resolve interrogative pronouns
+        if pronoun_text.lower() in INTERROGATIVE_PRONOUNS:
+            return None, 0.0
+
+        p_gender, p_number = self.pronoun_attrs(pronoun_text)
+        if not self.candidates:
+            return None, 0.0
+
+        # Compute log-score for each candidate
+        log_scores = []
+        for cand in self.candidates:
+            # HARD FILTERS — gender / number mismatch → -inf
+            if (p_gender != 'UNKNOWN' and cand['gender'] != 'UNKNOWN'
+                    and p_gender != cand['gender']):
+                log_scores.append((cand['eid'], float('-inf')))
+                continue
+            if (p_number != 'UNKNOWN' and cand['number'] != 'UNKNOWN'
+                    and p_number != cand['number']):
+                log_scores.append((cand['eid'], float('-inf')))
+                continue
+
+            # SOFT FEATURES
+            f = {
+                'recency':       self._f_recency(cand, sent_idx),
+                'parallelism':   self._f_parallelism(cand, pronoun_dep),
+                'salience':      self._f_salience(cand),
+                'subject_bias':  self._f_subject_bias(cand),
+                'semantic':      self._f_semantic(cand, context_embedding),
+                'first_mention': self._f_first_mention(cand, sent_idx),
+            }
+            log_score = sum(FEATURE_WEIGHTS[k] * f[k] for k in FEATURE_WEIGHTS)
+            log_scores.append((cand['eid'], log_score))
+
+        # Softmax → proper probabilities
+        import math
+        finite = [(eid, s) for eid, s in log_scores if s != float('-inf')]
+        if not finite:
+            return None, 0.0
+        max_s = max(s for _, s in finite)
+        exp_scores = [(eid, math.exp(s - max_s)) for eid, s in finite]
+        total = sum(e for _, e in exp_scores)
+        probs = [(eid, e / total) for eid, e in exp_scores]
+        probs.sort(key=lambda x: -x[1])
+
+        best_eid, best_p = probs[0]
+        if best_p < COREF_THRESHOLD:
+            return None, 0.0
+        return best_eid, best_p
+
+
+# --------------------------------------------------------------------
+# 2b. ENTITY MERGING (string‑match only) + coref integration
 # --------------------------------------------------------------------
 MERGE_METHOD = 'exact_string_match_v1'
 
 class EntityRegistry:
     """
     Owns entity creation and lookup. Merges by exact lowercased string.
+    Integrates with CorefResolver for pronoun resolution.
     """
     def __init__(self, encoder: SentenceTransformer):
         self.encoder = encoder
         self.entities: Dict[int, Dict[str, Any]] = {}
         self._text_to_id: Dict[str, int] = {}
         self._next_id = 0
+        self.coref = CorefResolver(encoder)
 
-    def resolve_or_create(self, text: str, sent_idx: int, is_pronoun: bool) -> Tuple[int, int]:
+    def resolve_or_create(self, text: str, sent_idx: int, is_pronoun: bool,
+                          dep: str = None, token=None,
+                          context_embedding=None) -> Tuple[int, int, bool]:
+        """Returns (eid, mention_idx, was_resolved)."""
         key = text.lower().strip()
+
+        # --- PRONOUN PATH: ask the resolver first ---
         if is_pronoun:
+            best_eid, prob = self.coref.resolve(
+                text, dep or '', sent_idx, context_embedding)
+            if best_eid is not None:
+                mention_idx = self._add_mention(best_eid, text, sent_idx,
+                                                is_pronoun=True)
+                return best_eid, mention_idx, True
+            # fallback: unresolved pronoun becomes its own entity
             eid = self._next_id
             self._next_id += 1
             self._create(eid, text, sent_idx, is_pronoun=True)
-            return eid, 0
+            return eid, 0, False
 
+        # --- NON-PRONOUN PATH: exact string match or create ---
         if key in self._text_to_id:
             eid = self._text_to_id[key]
             mention_idx = self._add_mention(eid, text, sent_idx, is_pronoun=False)
-            return eid, mention_idx
+        else:
+            eid = self._next_id
+            self._next_id += 1
+            self._text_to_id[key] = eid
+            self._create(eid, text, sent_idx, is_pronoun=False)
+            mention_idx = 0
 
-        eid = self._next_id
-        self._next_id += 1
-        self._text_to_id[key] = eid
-        self._create(eid, text, sent_idx, is_pronoun=False)
-        return eid, 0
+        # Register as a candidate for future pronouns
+        if token is not None:
+            gender, number = self.coref.infer_entity_attrs(token)
+            emb = self.entities[eid]['mentions'][-1]['embedding']
+            self.coref.register_entity(
+                eid, text, sent_idx, dep or '', gender, number, emb, token)
+
+        return eid, mention_idx, False
 
     def _create(self, eid: int, text: str, sent_idx: int, is_pronoun: bool):
         emb = self.encoder.encode([text], convert_to_tensor=True).squeeze(0).cpu()
@@ -365,6 +598,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             'confidence': confidence,
             'reliability': reliability,
             'is_conjunct': is_conjunct,
+            'entity_token': entity_token,   # store token for coref registration
         })
 
         feature_log.append({
@@ -407,11 +641,11 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
             filler = prep_objs[0] if prep_objs else child
             add_role('RECIPIENT', filler.text, filler.text.lower() in PRONOUNS,
-                     'direct_iobj', child, dep)
+                     'direct_iobj', child, dep, entity_token=filler)
 
         elif dep == 'attr' or dep == 'acomp':
             add_role('MODIFIER', child.text, False,
-                     'direct_comp', child, dep)
+                     'direct_comp', child, dep, entity_token=child)
 
         elif dep == 'prep':
             prep_objs = [c for c in child.children if c.dep_ == 'pobj']
@@ -428,7 +662,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
 
         elif dep == 'advmod':
             add_role('MANNER', child.text, False,
-                     'direct_advmod', child, dep)
+                     'direct_advmod', child, dep, entity_token=child)
 
         elif dep == 'npadvmod':
             if child.lemma_.lower() in TIME_NOUNS or child.text.lower() in TIME_NOUNS:
@@ -436,7 +670,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             else:
                 role = 'MANNER'
             add_role(role, child.text, child.text.lower() in PRONOUNS,
-                     'direct_npadvmod', child, dep)
+                     'direct_npadvmod', child, dep, entity_token=child)
 
         elif dep == 'neg':
             roles.append({
@@ -450,6 +684,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
                 'confidence': 1.0,
                 'reliability': 1.0,
                 'is_conjunct': False,
+                'entity_token': None,
             })
 
     # ---- Subject inheritance for control/raising/relcl ----
@@ -477,7 +712,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
                     matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
                     if matrix_subj and is_valid_filler(matrix_subj, 'AGENT'):
                         add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
-                                 'relcl_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
+                                 'relcl_inherited', matrix_subj, matrix_subj.dep_, weight=0.7,
+                                 entity_token=matrix_subj)
         else:
             if not has_agent:
                 matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
@@ -490,7 +726,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
                     source = 'subj_control'
                 if inherited is not None and is_valid_filler(inherited, 'AGENT'):
                     add_role('AGENT', inherited.text, inherited.text.lower() in PRONOUNS,
-                             source, inherited, inherited.dep_, weight=0.7)
+                             source, inherited, inherited.dep_, weight=0.7,
+                             entity_token=inherited)
 
     # Conjunction handling for verbs (inherit subject)
     if pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
@@ -498,7 +735,8 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
         matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
         if matrix_subj is not None and is_valid_filler(matrix_subj, 'AGENT'):
             add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
-                     'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
+                     'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7,
+                     entity_token=matrix_subj)
 
     # v14: mood detection per sentence (using pred_token.sent, not the full doc)
     mood = 'interrogative' if is_interrogative(pred_token.sent) else 'declarative'
@@ -554,6 +792,9 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
         sent = normalise_punctuation(sent)
         doc = nlp(sent)
 
+        # Compute a context embedding for the current sentence (for the semantic feature)
+        sent_embedding = encoder.encode([sent], convert_to_tensor=True).squeeze(0).cpu()
+
         if debug:
             print(f"\n--- Sentence {sent_idx}: {sent!r} ---")
             for tok in doc:
@@ -589,15 +830,22 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                     })
                     continue
 
-                eid, mention_idx = registry.resolve_or_create(
-                    r['entity_text'], sent_idx, r['is_pronoun'])
+                # Use the resolver
+                eid, mention_idx, was_resolved = registry.resolve_or_create(
+                    r['entity_text'], sent_idx, r['is_pronoun'],
+                    dep=r.get('origin_dep'),
+                    token=r.get('entity_token'),
+                    context_embedding=sent_embedding,
+                )
 
                 confidence = r.get('confidence', r.get('weight', 0.5))
-                if r['is_pronoun']:
+
+                # Only log as unresolved if it was a pronoun AND the resolver failed
+                if r['is_pronoun'] and not was_resolved:
                     unresolved.append({
                         'entity_id': eid, 'text': r['entity_text'],
                         'sentence_idx': sent_idx,
-                        'reason': 'pronoun_not_resolved_v1',
+                        'reason': 'pronoun_not_resolved_probabilistic',
                     })
 
                 role_entries.append({
@@ -714,7 +962,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v16-local-negation <<<")
+    print(">>> RUNNING preprocess.py VERSION: v17-prob-coref <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

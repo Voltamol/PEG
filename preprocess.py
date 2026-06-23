@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v10-inline (text argument)
-# VERSION MARKER: v10-inline
+# preprocess.py — Graph‑PEG dataset generator, v11 (fixed validation + npadvmod)
+# VERSION MARKER: v11-entity-validation
 
 import argparse
 import pickle
@@ -160,6 +160,7 @@ TIME_NOUNS = {
     'minute', 'hour', 'day', 'week', 'month', 'year', 'decade',
     'minutes', 'hours', 'days', 'weeks', 'months', 'years', 'decades',
     'attempt', 'attempts', 'occasion', 'occasions',  # "after several attempts"
+    'today', 'tomorrow', 'yesterday', 'tonight',  # NEW: common time nouns
 }
 
 def map_prep_role(prep_token, prep_obj_token=None) -> str:
@@ -286,11 +287,11 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
     roles = []
 
     # Helper to add a role, tracking provenance and validation
-    def add_role(role, entity_text, is_pronoun, source, origin_token, origin_dep, weight=1.0):
-        # v10: validate the filler
-        if not is_valid_filler(origin_token, role):
-            # Skip adding this role entirely (or we could add with very low confidence)
-            # For now, we skip to avoid pollution.
+    # FIX: added entity_token parameter for validation (for prep phrases we pass the pobj)
+    def add_role(role, entity_text, is_pronoun, source, origin_token, origin_dep, weight=1.0, entity_token=None):
+        # If entity_token is not provided, use origin_token for validation
+        validate_token = entity_token if entity_token is not None else origin_token
+        if not is_valid_filler(validate_token, role):
             return
 
         refined = refine_role(event_type, role, origin_token)
@@ -334,11 +335,21 @@ def extract_event_for_predicate(pred_token, sent_idx, doc):
             if prep_objs:
                 obj = prep_objs[0]
                 role = map_prep_role(child, obj)
+                # FIX: pass obj as entity_token for validation
                 add_role(role, obj.text, obj.text.lower() in PRONOUNS,
-                         'prep_pobj', child, dep)
+                         'prep_pobj', child, dep, entity_token=obj)
         elif dep == 'advmod':
             add_role('MANNER', child.text, False,
                      'direct_advmod', child, dep)
+        # NEW: handle npadvmod (noun phrase adverbial modifier) – often time expressions
+        elif dep == 'npadvmod':
+            # Determine if it's a time noun
+            if child.lemma_.lower() in TIME_NOUNS or child.text.lower() in TIME_NOUNS:
+                role = 'TIME'
+            else:
+                role = 'MANNER'
+            add_role(role, child.text, child.text.lower() in PRONOUNS,
+                     'direct_npadvmod', child, dep)
         elif dep == 'neg':
             # POLARITY is a flag, not a real entity
             roles.append({
@@ -614,7 +625,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v10-inline <<<")
+    print(">>> RUNNING preprocess.py VERSION: v11-entity-validation <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')
@@ -630,7 +641,6 @@ if __name__ == "__main__":
 
     # Determine input source
     if args.text is not None:
-        # Use the provided text as a single sentence
         corpus = [args.text]
         is_demo = False
         output_file = args.output or 'inline_graph.pkl'
@@ -640,7 +650,6 @@ if __name__ == "__main__":
         is_demo = False
         output_file = args.output or (args.corpus_file.rsplit('.', 1)[0] + '_graph.pkl')
     else:
-        # Use the hard-coded demo corpus
         corpus = [
             "John hit the ball.",
             "The ball hit John.",

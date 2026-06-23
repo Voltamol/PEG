@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v18 (fast-coref)
-# VERSION MARKER: v18-fast-coref
+# preprocess.py — Graph‑PEG dataset generator, v16 (local negation)
+# VERSION MARKER: v16-local-negation
 
 import argparse
 import pickle
@@ -11,30 +11,13 @@ import torch
 import spacy
 from sentence_transformers import SentenceTransformer
 
-# v18: use fast-coref for coreference resolution
-try:
-    from fastcoref import CorefModel
-    COREF_AVAILABLE = True
-except ImportError:
-    COREF_AVAILABLE = False
-    print("  [INFO] fast-coref not installed. Coreference resolution disabled.")
-    print("  Install with: pip install fast-coref")
-
-# Global coref model (loaded once)
-_coref_model = None
-
-def get_coref_model():
-    global _coref_model
-    if _coref_model is None and COREF_AVAILABLE:
-        _coref_model = CorefModel()
-    return _coref_model
-
 # --------------------------------------------------------------------
 # 1. CONFIGURATION
 # --------------------------------------------------------------------
 CONFIDENCE_FLOOR = 0.5
 EMBEDDING_POLICY = 'most_recent'
 
+# v10: source reliability multipliers
 SOURCE_RELIABILITY = {
     'direct_nsubj': 1.0,
     'direct_nsubjpass': 1.0,
@@ -50,6 +33,7 @@ SOURCE_RELIABILITY = {
     'relcl_antecedent': 0.75,
     'neg_flag': 1.0,
     'direct_npadvmod': 0.8,
+    # v12: sources for conjuncts
     'direct_nsubj_conj': 0.9,
     'direct_dobj_conj': 0.9,
     'prep_pobj_conj': 0.85,
@@ -57,11 +41,13 @@ SOURCE_RELIABILITY = {
     'appos_inherited': 0.8,
 }
 
+# v10: blacklist for ambiguous/placeholder fillers
 ENTITY_BLACKLIST = {
     '_', 'which', 'what', 'that', 'who', 'whom', 'whose',
     'where', 'when', 'why', 'how'
 }
 
+# v10: allowed POS tags per role (None means any)
 ROLE_POS_ALLOWED = {
     'AGENT':     {'NOUN', 'PROPN', 'PRON'},
     'PATIENT':   {'NOUN', 'PROPN', 'PRON'},
@@ -80,6 +66,9 @@ ROLE_POS_ALLOWED = {
 MERGE_METHOD = 'exact_string_match_v1'
 
 class EntityRegistry:
+    """
+    Owns entity creation and lookup. Merges by exact lowercased string.
+    """
     def __init__(self, encoder: SentenceTransformer):
         self.encoder = encoder
         self.entities: Dict[int, Dict[str, Any]] = {}
@@ -254,7 +243,12 @@ def is_valid_filler(token, role):
     return True
 
 
+# v12: recursive expansion of conjunctions and appositives
 def expand_filler(token, visited=None) -> Generator:
+    """
+    Recursively yield the token and all its coordinated/apposited children.
+    Handles: 'John, Mary, and Sam' and 'John (my brother)'.
+    """
     if visited is None:
         visited = set()
     if token.i in visited:
@@ -266,11 +260,19 @@ def expand_filler(token, visited=None) -> Generator:
             yield from expand_filler(child, visited)
 
 
+# v13: syntactic interrogative detection (works with Doc or Span)
 def is_interrogative(doc_or_span) -> bool:
+    """
+    Returns True if the sentence is an interrogative (question).
+    Checks for:
+    1. Trailing '?'.
+    2. Subject-auxiliary inversion: AUX before nsubj for the ROOT verb.
+    """
     text = doc_or_span.text.strip()
     if text.endswith('?'):
         return True
 
+    # Find the root verb
     root = None
     for token in doc_or_span:
         if token.dep_ == 'ROOT':
@@ -279,6 +281,7 @@ def is_interrogative(doc_or_span) -> bool:
     if root is None:
         return False
 
+    # Check for auxiliary before subject
     aux_token = None
     subj_token = None
 
@@ -295,72 +298,44 @@ def is_interrogative(doc_or_span) -> bool:
     return False
 
 
+# v15: punctuation normalisation to help sentence segmentation
 def normalise_punctuation(text: str) -> str:
+    """Normalise ambiguous punctuation that confuses spaCy's sentence boundary detection."""
     text = text.replace("?,", "? ").replace("?.", "? ")
     text = text.replace("!,", "! ").replace("!.", "! ")
     return text
 
 
+# v16: local negation detection (does NOT descend into clausal complements)
 def has_local_negation(pred_token) -> bool:
+    """
+    Check for negation directly attached to the predicate or its auxiliary chain.
+    Does NOT descend into clausal complements (ccomp, advcl, xcomp).
+    """
+    # 1. Check if the predicate itself has a 'neg' child
     for child in pred_token.children:
         if child.dep_ == 'neg':
             return True
+        # 2. Check if an auxiliary (aux) has a 'neg' child (e.g., "doesn't")
         if child.dep_ == 'aux':
             for grandchild in child.children:
                 if grandchild.dep_ == 'neg':
                     return True
+            # 3. Check if the auxiliary token ends with "n't" (e.g., "don't" as a single token)
             if child.text.lower().endswith("n't"):
                 return True
+
+    # 4. Check if the predicate text itself ends with "n't" (e.g., "can't")
     if pred_token.text.lower().endswith("n't"):
         return True
+
     return False
 
 
-# v18: fast-coref coreference map builder
-def get_coref_map(doc):
-    """
-    Build a mapping from token index to canonical mention text using fast-coref.
-    """
-    coref_map = {}
-    if not COREF_AVAILABLE:
-        return coref_map
-
-    try:
-        model = get_coref_model()
-        if model is None:
-            return coref_map
-
-        text = doc.text
-        clusters = model(text)  # list of clusters
-
-        for cluster in clusters:
-            mentions = cluster['mentions']
-            # Choose the main mention: prefer non-pronoun, longest
-            best = None
-            for m in mentions:
-                if m['text'].lower() not in PRONOUNS:
-                    if best is None or len(m['text']) > len(best['text']):
-                        best = m
-            if best is None and mentions:
-                best = mentions[0]
-            if best is None:
-                continue
-            main_text = best['text']
-
-            # Map each mention's tokens to main_text
-            for m in mentions:
-                start_char = m['start']
-                end_char = m['end']
-                for token in doc:
-                    if token.idx >= start_char and token.idx + len(token.text) <= end_char:
-                        coref_map[token.i] = main_text
-    except Exception as e:
-        print(f"  [WARN] coref failed: {e}")
-
-    return coref_map
-
-
 def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
+    """
+    Extracts one event, including provenance and feature logging.
+    """
     event_type = normalize_event_type(pred_token.lemma_)
     if event_type is None:
         return None
@@ -406,6 +381,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             'sentence_idx': sent_idx,
         })
 
+    # Process direct children of the predicate
     for child in pred_token.children:
         dep = child.dep_
 
@@ -516,6 +492,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
                     add_role('AGENT', inherited.text, inherited.text.lower() in PRONOUNS,
                              source, inherited, inherited.dep_, weight=0.7)
 
+    # Conjunction handling for verbs (inherit subject)
     if pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
         matrix = pred_token.head
         matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
@@ -523,7 +500,10 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
             add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
                      'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
 
+    # v14: mood detection per sentence (using pred_token.sent, not the full doc)
     mood = 'interrogative' if is_interrogative(pred_token.sent) else 'declarative'
+
+    # v16: use local negation detection (does not leak from embedded clauses)
     polarity = 'negative' if has_local_negation(pred_token) else 'positive'
 
     return {
@@ -561,7 +541,6 @@ def extract_events(doc, sent_idx):
 def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                output_file='graph_corpus.pkl', debug=False):
     nlp = spacy.load('en_core_web_sm')
-
     encoder = SentenceTransformer(model_name)
     registry = EntityRegistry(encoder)
 
@@ -575,15 +554,10 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
         sent = normalise_punctuation(sent)
         doc = nlp(sent)
 
-        # v18: build coreference map for this document
-        coref_map = get_coref_map(doc)
-
         if debug:
             print(f"\n--- Sentence {sent_idx}: {sent!r} ---")
             for tok in doc:
                 print(f"  {tok.text:12s} dep={tok.dep_:10s} head={tok.head.text:10s} pos={tok.pos_}")
-            if coref_map:
-                print(f"  Coref map: { {doc[i].text: coref_map[i] for i in coref_map} }")
 
         events = extract_events(doc, sent_idx)
 
@@ -615,28 +589,13 @@ def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
                     })
                     continue
 
-                # v18: coreference resolution for pronouns
-                entity_text = r['entity_text']
-                is_pronoun = r['is_pronoun']
-
-                if is_pronoun and coref_map:
-                    token_idx = r.get('origin_token_idx', -1)
-                    if token_idx != -1 and token_idx in coref_map:
-                        resolved_text = coref_map[token_idx]
-                        # Only apply if the resolved text is not a pronoun itself
-                        if resolved_text.lower() not in PRONOUNS:
-                            entity_text = resolved_text
-                            is_pronoun = False  # Mark as resolved
-
                 eid, mention_idx = registry.resolve_or_create(
-                    entity_text, sent_idx, is_pronoun)
+                    r['entity_text'], sent_idx, r['is_pronoun'])
 
                 confidence = r.get('confidence', r.get('weight', 0.5))
-
-                # Only log unresolved if we kept it as pronoun
-                if is_pronoun:
+                if r['is_pronoun']:
                     unresolved.append({
-                        'entity_id': eid, 'text': entity_text,
+                        'entity_id': eid, 'text': r['entity_text'],
                         'sentence_idx': sent_idx,
                         'reason': 'pronoun_not_resolved_v1',
                     })
@@ -731,7 +690,7 @@ def run_self_checks(output, is_demo_corpus=True):
 
 
 # --------------------------------------------------------------------
-# 7. DUMP EVENTS (unchanged)
+# 7. DUMP EVENTS (updated to show is_conjunct)
 # --------------------------------------------------------------------
 def dump_events(output):
     print("\n=== FULL EVENT DUMP ===")
@@ -755,7 +714,7 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v18-fast-coref <<<")
+    print(">>> RUNNING preprocess.py VERSION: v16-local-negation <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')

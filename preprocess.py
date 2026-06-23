@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v10 (role correctness, confidence)
-# VERSION MARKER: v10-correctness
+# preprocess.py — Graph‑PEG dataset generator, v10-inline (text argument)
+# VERSION MARKER: v10-inline
 
 import argparse
 import pickle
@@ -192,7 +192,8 @@ def refine_role(event_type: str, role_name: str, token) -> str:
     """
     if role_name == 'MODIFIER' and token.dep_ in ('attr', 'acomp'):
         # Copula complement (predicate adjective/nominal)
-        if event_type in ('be', 'seem', 'become', 'appear'):
+        if event_type in ('be', 'seem', 'become', 'appear', 'remain', 'stay',
+                          'look', 'feel', 'smell', 'taste', 'sound', 'keep'):
             return 'ATTRIBUTE'
     if role_name == 'LOCATION' and token.dep_ == 'prep' and token.lemma_ == 'with':
         # Could be INSTRUMENT (but we need to know the verb)
@@ -613,20 +614,33 @@ def dump_events(output):
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v10-correctness <<<")
+    print(">>> RUNNING preprocess.py VERSION: v10-inline <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')
     parser.add_argument('--corpus-file', type=str, default=None,
                          help='Path to a text file with one sentence per line. '
                               'If omitted, runs the 5-sentence demo corpus.')
+    parser.add_argument('--text', type=str, default=None,
+                         help='Direct sentence(s) to process. Provide as a quoted string. '
+                              'If given, --corpus-file is ignored.')
     parser.add_argument('--output', type=str, default=None,
                          help='Output pickle path.')
     args = parser.parse_args()
 
-    is_demo = args.corpus_file is None
-
-    if is_demo:
+    # Determine input source
+    if args.text is not None:
+        # Use the provided text as a single sentence
+        corpus = [args.text]
+        is_demo = False
+        output_file = args.output or 'inline_graph.pkl'
+    elif args.corpus_file is not None:
+        with open(args.corpus_file) as f:
+            corpus = [line.strip() for line in f if line.strip()]
+        is_demo = False
+        output_file = args.output or (args.corpus_file.rsplit('.', 1)[0] + '_graph.pkl')
+    else:
+        # Use the hard-coded demo corpus
         corpus = [
             "John hit the ball.",
             "The ball hit John.",
@@ -634,11 +648,8 @@ if __name__ == "__main__":
             "The cat that chased the mouse is black.",
             "She gave him a book.",
         ]
+        is_demo = True
         output_file = args.output or 'demo_graph_corpus.pkl'
-    else:
-        with open(args.corpus_file) as f:
-            corpus = [line.strip() for line in f if line.strip()]
-        output_file = args.output or (args.corpus_file.rsplit('.', 1)[0] + '_graph.pkl')
 
     output = preprocess(corpus, output_file=output_file, debug=args.debug)
     ok = run_self_checks(output, is_demo_corpus=is_demo)

@@ -32,6 +32,7 @@ SOURCE_RELIABILITY = {
     'relcl_inherited': 0.55,
     'relcl_antecedent': 0.75,
     'neg_flag': 1.0,          # polarity flags are exact
+    'direct_npadvmod': 0.8,   # noun-phrase adverbial modifiers (usually time/location)
 }
 
 # v10: blacklist for ambiguous/placeholder fillers

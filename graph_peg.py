@@ -1,520 +1,567 @@
 #!/usr/bin/env python3
-# graph_peg_v17.py — MLP predictor + InfoNCE, tuned for large corpus
-# VERSION MARKER: v19-add-attribute-role
+# preprocess.py — Graph‑PEG dataset generator, v9 (provenance, refined roles)
+# VERSION MARKER: v9-provenance
+
+import argparse
+import pickle
+import sys
+from typing import List, Dict, Tuple, Optional, Any
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pickle
-import random
-import numpy as np
-from typing import List, Dict, Optional, Any
-from torch.optim.lr_scheduler import StepLR
+import spacy
+from sentence_transformers import SentenceTransformer
 
 # --------------------------------------------------------------------
 # 1. CONFIGURATION
 # --------------------------------------------------------------------
-class GraphPEGConfig:
-    def __init__(self):
-        self.hidden_dim = 256
-        self.role_dim = 64
-        self.lr = 5e-5                    # lower LR for stability
-        self.weight_decay = 1e-4          # stronger regularization
-        self.epochs = 150
-        self.dropout = 0.2
-        self.noise_std = 0.05
-        self.batch_size = 32
-        self.verb_weight = 0.2
-        self.temperature = 0.05           # sharper
-        self.num_negatives = 15           # more negatives
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
+CONFIDENCE_FLOOR = 0.5
+EMBEDDING_POLICY = 'most_recent'
 
 # --------------------------------------------------------------------
-# 2. MODEL
+# 2. ENTITY MERGING (string‑match only)
 # --------------------------------------------------------------------
-class GraphPEGModel(nn.Module):
-    def __init__(self, config: GraphPEGConfig, dataset: Dict[str, Any]):
-        super().__init__()
-        self.config = config
-        self.dataset = dataset
+MERGE_METHOD = 'exact_string_match_v1'
 
-        # vocab
-        # v18 NOTE: 'ATTRIBUTE' added here to match preprocess.py v9, which
-        # split copula complements (attr/acomp — "is tired", "is a carpenter")
-        # out of MODIFIER into their own role. Without this entry, any
-        # dataset built with the v9+ preprocessor raises KeyError on the
-        # first ATTRIBUTE-bearing event, since this dict is the model's
-        # only source of truth for which roles have an embedding slot.
-        self.role_to_idx = {
-            'AGENT': 0, 'PATIENT': 1, 'RECIPIENT': 2, 'LOCATION': 3,
-            'TIME': 4, 'MANNER': 5, 'MODIFIER': 6, 'POLARITY': 7, 'MOOD': 8,
-            'ATTRIBUTE': 9
+class EntityRegistry:
+    """
+    Owns entity creation and lookup. Merges by exact lowercased string.
+    """
+    def __init__(self, encoder: SentenceTransformer):
+        self.encoder = encoder
+        self.entities: Dict[int, Dict[str, Any]] = {}
+        self._text_to_id: Dict[str, int] = {}
+        self._next_id = 0
+
+    def resolve_or_create(self, text: str, sent_idx: int, is_pronoun: bool) -> Tuple[int, int]:
+        key = text.lower().strip()
+        if is_pronoun:
+            eid = self._next_id
+            self._next_id += 1
+            self._create(eid, text, sent_idx, is_pronoun=True)
+            return eid, 0
+
+        if key in self._text_to_id:
+            eid = self._text_to_id[key]
+            mention_idx = self._add_mention(eid, text, sent_idx, is_pronoun=False)
+            return eid, mention_idx
+
+        eid = self._next_id
+        self._next_id += 1
+        self._text_to_id[key] = eid
+        self._create(eid, text, sent_idx, is_pronoun=False)
+        return eid, 0
+
+    def _create(self, eid: int, text: str, sent_idx: int, is_pronoun: bool):
+        emb = self.encoder.encode([text], convert_to_tensor=True).squeeze(0).cpu()
+        self.entities[eid] = {
+            'canonical_text': text,
+            'merge_method': MERGE_METHOD,
+            'mentions': [{
+                'text': text,
+                'sentence_idx': sent_idx,
+                'embedding': emb,
+                'gender': 'UNKNOWN',
+                'number': 'UNKNOWN',
+                'is_pronoun': is_pronoun,
+            }],
+            'embedding_policy': EMBEDDING_POLICY,
         }
-        self.idx_to_role = {v: k for k, v in self.role_to_idx.items()}
-        self.num_roles = len(self.role_to_idx)
 
-        self.event_type_to_idx = dict(dataset['event_types'])
-        self.num_event_types = len(self.event_type_to_idx)
+    def _add_mention(self, eid: int, text: str, sent_idx: int, is_pronoun: bool) -> int:
+        emb = self.encoder.encode([text], convert_to_tensor=True).squeeze(0).cpu()
+        mention = {
+            'text': text,
+            'sentence_idx': sent_idx,
+            'embedding': emb,
+            'gender': 'UNKNOWN',
+            'number': 'UNKNOWN',
+            'is_pronoun': is_pronoun,
+        }
+        self.entities[eid]['mentions'].append(mention)
+        return len(self.entities[eid]['mentions']) - 1
 
-        # embeddings
-        self.event_embeddings = nn.Parameter(
-            torch.randn(self.num_event_types, config.hidden_dim) * 0.01
-        )
-        self.role_embeddings = nn.Parameter(
-            torch.randn(self.num_roles, config.role_dim) * 0.01
-        )
-        self.role_proj = nn.Linear(config.role_dim, config.hidden_dim)
 
-        # MLP predictor: 2 layers with residual connection
-        self.predictor = nn.Sequential(
-            nn.Linear(config.hidden_dim + config.role_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.LayerNorm(config.hidden_dim),
-        )
-        # Final linear projection to hidden_dim (no activation)
-        self.final_proj = nn.Linear(config.hidden_dim, config.hidden_dim)
+PRONOUNS = {
+    'he', 'him', 'his', 'himself',
+    'she', 'her', 'hers', 'herself',
+    'it', 'its', 'itself',
+    'they', 'them', 'their', 'theirs', 'themselves',
+    'i', 'me', 'my', 'mine', 'myself',
+    'you', 'your', 'yours', 'yourself',
+    'we', 'us', 'our', 'ours', 'ourselves',
+}
 
-        # entity projection
-        sample_ent = next(iter(self.dataset['entities'].values()))
-        sample_emb = sample_ent['mentions'][0]['embedding']
-        self.embed_dim = sample_emb.shape[0]
-        self.entity_proj = nn.Linear(self.embed_dim, config.hidden_dim)
 
-        # move to device
-        self.to(config.device)
+# --------------------------------------------------------------------
+# 3. ROLE MAPPER (with provenance)
+# --------------------------------------------------------------------
+DEP_TO_ROLE = {
+    'nsubj': 'AGENT',
+    'nsubjpass': 'PATIENT',      # passive subject = patient
+    'dobj': 'PATIENT',
+    'iobj': 'RECIPIENT',
+    'dative': 'RECIPIENT',
+    'pobj': None,                # handled specially via prep
+    'advmod': 'MANNER',
+    'neg': 'POLARITY',
+    'amod': 'MODIFIER',
+}
 
-        # precompute entity embeddings
-        self._precompute_entity_embeddings()
+LOCATION_PREPS = {'in', 'at', 'on', 'by', 'near', 'under', 'over', 'behind',
+                  'to', 'into', 'from', 'through', 'inside', 'outside',
+                  'beneath', 'beside', 'within', 'above', 'below'}
+TIME_PREPS = {'at', 'on', 'in', 'during', 'after', 'before', 'since', 'until'}
 
-        # role‑entity map for hard negatives
-        self._build_role_entity_map()
+# Expanded TIME noun list (from previous feedback)
+TIME_NOUNS = {
+    'sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday',
+    'saturday', 'sundays', 'mondays', 'tuesdays', 'wednesdays',
+    'thursdays', 'fridays', 'saturdays',
+    'morning', 'afternoon', 'evening', 'night', 'noon', 'midnight',
+    'sunrise', 'sunset', 'dawn', 'dusk',
+    'january', 'february', 'march', 'april', 'may', 'june', 'july',
+    'august', 'september', 'october', 'november', 'december',
+    'minute', 'hour', 'day', 'week', 'month', 'year', 'decade',
+    'minutes', 'hours', 'days', 'weeks', 'months', 'years', 'decades',
+    'attempt', 'attempts', 'occasion', 'occasions',  # "after several attempts"
+}
 
-    def _precompute_entity_embeddings(self):
-        entities = self.dataset['entities']
-        emb_list = []
-        for eid in sorted(entities.keys()):
-            policy = entities[eid]['embedding_policy']
-            if policy == 'most_recent':
-                emb = entities[eid]['mentions'][-1]['embedding']
-            elif policy == 'mean':
-                emb = torch.mean(torch.stack([m['embedding'] for m in entities[eid]['mentions']]), dim=0)
+def map_prep_role(prep_token, prep_obj_token=None) -> str:
+    """
+    Determines role of a prepositional phrase.
+    TIME fix: only assign TIME if the preposition is in TIME_PREPS AND
+    the object lemma is in TIME_NOUNS (or the text is a time noun).
+    Otherwise, default to LOCATION (or MODIFIER if not in LOCATION_PREPS).
+    """
+    lemma = prep_token.lemma_.lower()
+    obj_lemma = prep_obj_token.lemma_.lower() if prep_obj_token is not None else ''
+    obj_text = prep_obj_token.text.lower() if prep_obj_token is not None else ''
+
+    # First, if it's a clear time expression
+    if lemma in TIME_PREPS and (obj_lemma in TIME_NOUNS or obj_text in TIME_NOUNS):
+        return 'TIME'
+
+    # If it's a location preposition, even if the object is not in TIME_NOUNS
+    if lemma in LOCATION_PREPS:
+        return 'LOCATION'
+
+    # Everything else becomes MODIFIER (can be refined later)
+    return 'MODIFIER'
+
+
+def refine_role(event_type: str, role_name: str, token) -> str:
+    """
+    Refines a generic role (MODIFIER, LOCATION, etc.) into a more specific one
+    based on the event type and dependency relation.
+    """
+    if role_name == 'MODIFIER' and token.dep_ in ('attr', 'acomp'):
+        # Copula complement (predicate adjective/nominal)
+        if event_type in ('be', 'seem', 'become', 'appear'):
+            return 'ATTRIBUTE'
+    if role_name == 'LOCATION' and token.dep_ == 'prep' and token.lemma_ == 'with':
+        # Could be INSTRUMENT (but we need to know the verb)
+        # We'll keep as LOCATION for now; can be overridden later.
+        pass
+    # Keep as is
+    return role_name
+
+
+# --------------------------------------------------------------------
+# 4. EVENT EXTRACTION
+# --------------------------------------------------------------------
+CONTRACTION_LEMMA_MAP = {
+    "'s": 'be', "’s": 'be',
+    "'m": 'be', "’m": 'be',
+    "'re": 'be', "’re": 'be',
+    "'ve": 'have', "’ve": 'have',
+    "'d": 'have', "’d": 'have',
+    'tis': 'be', "'tis": 'be',
+    'twas': 'be', "'twas": 'be',
+    'doth': 'do', 'dost': 'do',
+    'hath': 'have',
+    # Add standalone apostrophe (sometimes root)
+    "'": 'be', "’": 'be',
+}
+
+BARE_MODAL_LEMMAS = {
+    'can', 'could', 'will', 'would', 'must', 'should', 'shall', 'might', 'may',
+}
+
+def normalize_event_type(raw_lemma: str) -> Optional[str]:
+    lemma_lower = raw_lemma.lower()
+    if lemma_lower in BARE_MODAL_LEMMAS:
+        return None
+    return CONTRACTION_LEMMA_MAP.get(lemma_lower, lemma_lower)
+
+OBJECT_CONTROL_VERBS = {
+    'tell', 'ask', 'order', 'want', 'allow', 'force', 'persuade',
+    'convince', 'remind', 'warn', 'permit', 'instruct', 'urge',
+}
+
+
+def find_predicate_tokens(doc):
+    """
+    Returns all verb/aux tokens that can be predicates (excluding aux, amod).
+    """
+    predicates = []
+    for tok in doc:
+        if tok.pos_ in ('VERB', 'AUX') and tok.dep_ not in ('aux', 'auxpass', 'amod'):
+            predicates.append(tok)
+    return predicates
+
+
+def extract_event_for_predicate(pred_token, sent_idx, doc):
+    """
+    Extracts one event, including provenance (source, origin token, dep).
+    Returns a dict with:
+      - event_type: str
+      - roles: list of dict with keys: role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight
+      - metadata: dict
+    """
+    event_type = normalize_event_type(pred_token.lemma_)
+    if event_type is None:
+        return None
+
+    roles = []
+
+    # Helper to add a role, tracking provenance
+    def add_role(role, entity_text, is_pronoun, source, origin_token_idx, origin_dep, weight=1.0):
+        # Refine role if needed
+        refined = refine_role(event_type, role, origin_token_idx)  # we need the token object; we'll pass it later
+        roles.append({
+            'role': refined,
+            'entity_text': entity_text,
+            'is_pronoun': is_pronoun,
+            'source': source,
+            'origin_token_idx': origin_token_idx.i,  # token index in doc
+            'origin_dep': origin_dep,
+            'weight': weight,
+        })
+
+    # Process direct children of the predicate
+    for child in pred_token.children:
+        dep = child.dep_
+        if dep in ('nsubj', 'nsubjpass'):
+            add_role('AGENT', child.text, child.text.lower() in PRONOUNS,
+                     'direct_nsubj', child, dep)
+        elif dep == 'dobj':
+            add_role('PATIENT', child.text, child.text.lower() in PRONOUNS,
+                     'direct_dobj', child, dep)
+        elif dep in ('iobj', 'dative'):
+            # If the dative token is a preposition, look for pobj
+            prep_objs = [c for c in child.children if c.dep_ == 'pobj']
+            filler = prep_objs[0] if prep_objs else child
+            add_role('RECIPIENT', filler.text, filler.text.lower() in PRONOUNS,
+                     'direct_iobj', child, dep)
+        elif dep == 'attr' or dep == 'acomp':
+            # Copula complement: will be refined to ATTRIBUTE later
+            add_role('MODIFIER', child.text, False,
+                     'direct_comp', child, dep)
+        elif dep == 'prep':
+            prep_objs = [c for c in child.children if c.dep_ == 'pobj']
+            if prep_objs:
+                obj = prep_objs[0]
+                role = map_prep_role(child, obj)
+                add_role(role, obj.text, obj.text.lower() in PRONOUNS,
+                         'prep_pobj', child, dep)
+        elif dep == 'advmod':
+            add_role('MANNER', child.text, False,
+                     'direct_advmod', child, dep)
+        elif dep == 'neg':
+            # POLARITY is a flag, not a real entity
+            roles.append({
+                'role': 'POLARITY',
+                'entity_text': 'negative',
+                'is_pronoun': False,
+                'source': 'neg_flag',
+                'origin_token_idx': child.i,
+                'origin_dep': dep,
+                'weight': 1.0,
+            })
+
+    # ---- Subject inheritance for control/raising/relcl ----
+    # Inherit subject from matrix verb if this predicate is a complement or relative clause
+    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl', 'relcl'):
+        matrix = pred_token.head
+        # Check if we already have an AGENT from a direct child (e.g., relative pronoun)
+        has_agent = any(r['role'] == 'AGENT' for r in roles)
+
+        # For relative clauses, if we have an AGENT that is a relative pronoun, replace it with the antecedent
+        RELATIVE_PRONOUNS = {'that', 'which', 'who', 'whom', 'whose'}
+        if pred_token.dep_ == 'relcl':
+            antecedent = matrix.text
+            for r in roles:
+                if r['role'] == 'AGENT' and r['entity_text'].lower() in RELATIVE_PRONOUNS:
+                    # Replace with antecedent
+                    r['entity_text'] = antecedent
+                    r['is_pronoun'] = False
+                    r['source'] = 'relcl_antecedent'
+                    r['origin_token_idx'] = matrix.i
+                    r['origin_dep'] = matrix.dep_
+                    break
             else:
-                emb = entities[eid]['mentions'][0]['embedding']
-            emb_list.append(emb)
-        raw_embs = torch.stack(emb_list)
-        with torch.no_grad():
-            proj_embs = self.entity_proj(raw_embs.to(self.config.device))
-        self.register_buffer('entity_embeddings', proj_embs)
-        sorted_ids = sorted(entities.keys())
-        self._entity_id_to_row = {eid: i for i, eid in enumerate(sorted_ids)}
-        self.all_entity_ids = list(entities.keys())
+                # No relative pronoun AGENT, so we might need to inherit
+                if not has_agent:
+                    # Inherit from matrix subject
+                    matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+                    if matrix_subj:
+                        add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
+                                 'relcl_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
+        else:
+            # Control/raising: inherit subject from matrix
+            if not has_agent:
+                matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
+                matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+                # Object control vs subject control
+                if matrix.lemma_.lower() in OBJECT_CONTROL_VERBS and matrix_dobj is not None:
+                    inherited = matrix_dobj
+                    source = 'obj_control'
+                else:
+                    inherited = matrix_subj
+                    source = 'subj_control'
+                if inherited is not None:
+                    add_role('AGENT', inherited.text, inherited.text.lower() in PRONOUNS,
+                             source, inherited, inherited.dep_, weight=0.7)
 
-    def _build_role_entity_map(self):
-        self.role_entity_map = {}
-        for event in self.dataset['events']:
-            verb = event['event_type']
-            for role_info in event['roles']:
-                if role_info['entity_id'] is None:
+    # Conjunction handling: if this predicate is a conj, inherit subject from the head verb's subject
+    if pred_token.dep_ == 'conj' and not any(r['role'] == 'AGENT' for r in roles):
+        matrix = pred_token.head
+        matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+        if matrix_subj is not None:
+            add_role('AGENT', matrix_subj.text, matrix_subj.text.lower() in PRONOUNS,
+                     'conj_inherited', matrix_subj, matrix_subj.dep_, weight=0.7)
+
+    # Mood and polarity
+    mood = 'interrogative' if doc.text.strip().endswith('?') else 'declarative'
+    polarity = 'negative' if any(t.dep_ == 'neg' for t in pred_token.subtree) else 'positive'
+
+    return {
+        'event_type': event_type,
+        'roles': roles,
+        'metadata': {
+            'sentence': doc.text,
+            'mood': mood,
+            'polarity': polarity,
+            'predicate_dep': pred_token.dep_,
+        }
+    }
+
+
+def extract_events(doc, sent_idx):
+    predicates = find_predicate_tokens(doc)
+    events = []
+    for pred in predicates:
+        ev = extract_event_for_predicate(pred, sent_idx, doc)
+        if ev is None:
+            continue
+        if ev['roles']:
+            events.append(ev)
+        else:
+            # Warn only if it's not a bare modal (already filtered)
+            if pred.lemma_.lower() not in BARE_MODAL_LEMMAS:
+                print(f"  [WARN] predicate '{pred.text}' (dep={pred.dep_}) "
+                      f"in sentence {sent_idx} produced zero roles — check parse.")
+    return events
+
+
+# --------------------------------------------------------------------
+# 5. MAIN PIPELINE
+# --------------------------------------------------------------------
+def preprocess(corpus: List[str], model_name='all-MiniLM-L6-v2',
+               output_file='graph_corpus.pkl', debug=False):
+    nlp = spacy.load('en_core_web_sm')
+    encoder = SentenceTransformer(model_name)
+    registry = EntityRegistry(encoder)
+
+    all_events = []
+    unresolved = []
+    event_types: Dict[str, int] = {}
+    event_id_counter = 0
+
+    for sent_idx, sent in enumerate(corpus):
+        doc = nlp(sent)
+
+        if debug:
+            print(f"\n--- Sentence {sent_idx}: {sent!r} ---")
+            for tok in doc:
+                print(f"  {tok.text:12s} dep={tok.dep_:10s} head={tok.head.text:10s} pos={tok.pos_}")
+
+        events = extract_events(doc, sent_idx)
+
+        if debug:
+            print(f"  -> extracted {len(events)} event(s): "
+                  f"{[e['event_type'] for e in events]}")
+
+        for ev in events:
+            event_type = ev['event_type']
+            if event_type not in event_types:
+                event_types[event_type] = len(event_types)
+
+            role_entries = []
+            for r in ev['roles']:
+                if r['entity_text'] == 'negative':
+                    # POLARITY flag: no real entity
+                    role_entries.append({
+                        'role': r['role'],
+                        'entity_id': None,
+                        'mention_idx': None,
+                        'confidence': 1.0,
+                        'source': r.get('source', 'unknown'),
+                        'origin_token_idx': r.get('origin_token_idx', -1),
+                        'origin_dep': r.get('origin_dep', ''),
+                        'weight': r.get('weight', 1.0),
+                    })
                     continue
-                role = role_info['role']
-                key = (verb, role)
-                if key not in self.role_entity_map:
-                    self.role_entity_map[key] = []
-                self.role_entity_map[key].append(role_info['entity_id'])
-        for k in self.role_entity_map:
-            self.role_entity_map[k] = list(set(self.role_entity_map[k]))
 
-    def _get_event_type_embedding(self, event_type: str) -> torch.Tensor:
-        idx = self.event_type_to_idx[event_type]
-        return self.event_embeddings[idx]
+                eid, mention_idx = registry.resolve_or_create(
+                    r['entity_text'], sent_idx, r['is_pronoun'])
 
-    def _get_role_embedding(self, role_name: str) -> torch.Tensor:
-        idx = self.role_to_idx[role_name]
-        return self.role_embeddings[idx]
+                # Confidence is derived from source and is_pronoun; we don't hardcode, but we store weight
+                # We'll set confidence = weight for now, but can be recomputed later.
+                confidence = r.get('weight', 0.5)
+                if r['is_pronoun']:
+                    unresolved.append({
+                        'entity_id': eid, 'text': r['entity_text'],
+                        'sentence_idx': sent_idx,
+                        'reason': 'pronoun_not_resolved_v1',
+                    })
 
-    def _get_entity_embedding(self, entity_id: int) -> torch.Tensor:
-        row = self._entity_id_to_row[entity_id]
-        return self.entity_embeddings[row]
+                role_entries.append({
+                    'role': r['role'],
+                    'entity_id': eid,
+                    'mention_idx': mention_idx,
+                    'confidence': confidence,
+                    'source': r.get('source', 'unknown'),
+                    'origin_token_idx': r.get('origin_token_idx', -1),
+                    'origin_dep': r.get('origin_dep', ''),
+                    'weight': r.get('weight', 1.0),
+                })
 
-    def _compose_context(self, event_data: Dict, exclude_role_slot: Optional[int] = None) -> torch.Tensor:
-        verb_emb = self._get_event_type_embedding(event_data['event_type'])
-        role_sum = torch.zeros(self.config.hidden_dim, device=self.config.device)
-        for i, role_info in enumerate(event_data['roles']):
-            if i == exclude_role_slot:
-                continue
-            if role_info['entity_id'] is None:
-                continue
-            role = role_info['role']
-            entity_id = role_info['entity_id']
-            role_emb = self.role_proj(self._get_role_embedding(role))
-            entity_emb = self._get_entity_embedding(entity_id)
-            role_sum = role_sum + role_emb * entity_emb
-        return self.config.verb_weight * verb_emb + (1 - self.config.verb_weight) * role_sum
+            all_events.append({
+                'event_id': event_id_counter,
+                'event_type': event_type,
+                'sentence_idx': sent_idx,
+                'roles': role_entries,
+                'metadata': ev['metadata'],
+            })
+            event_id_counter += 1
 
-    def _predict_filler(self, context_vec: torch.Tensor, role: str) -> torch.Tensor:
-        # CONFIRMED BUG, found via layer-by-layer cosine-similarity
-        # tracing on real corpus scale: context_vec's norm at
-        # initialization (~0.035) is roughly 3x smaller than
-        # role_embeddings' norm (~0.10), since both are scaled by *0.01
-        # but role_sum involves fewer/smaller terms after the verb_weight
-        # mixing. Going into the first Linear layer of `predictor`, this
-        # imbalance means the layer's output is dominated almost entirely
-        # by WHICH ROLE is being predicted, not by the actual event
-        # context — confirmed empirically: two completely unrelated
-        # events produced predictor outputs with 0.999 cosine similarity,
-        # both before AND after training (it got worse after training,
-        # 0.9989 -> 0.9999, meaning gradient descent was reinforcing the
-        # collapse rather than fixing it). This explains the flat,
-        # undifferentiated surprise scores in the novelty test (0.8-0.93
-        # for both "easy known" and "completely novel" cases — the
-        # predictor's output barely depends on context at all).
-        #
-        # Fix: normalize context_vec to unit norm (matching role_emb's
-        # already-comparable scale) before concatenation, so the first
-        # Linear layer receives two terms of comparable magnitude and
-        # has to actually use both, rather than the larger term
-        # dominating by initialization accident.
-        context_normed = F.normalize(context_vec, dim=0, eps=1e-8)
-        role_emb = self._get_role_embedding(role)
-        combined = torch.cat([context_normed, role_emb], dim=-1)
-        hidden = self.predictor(combined)         # (hidden_dim,)
-        return self.final_proj(hidden)            # (hidden_dim,)
+    output = {
+        'entities': registry.entities,
+        'events': all_events,
+        'event_types': event_types,
+        'unresolved': unresolved,
+    }
 
-    def compute_loss(self, event_id: int, role_slot_idx: int) -> torch.Tensor:
-        event_data = self.dataset['events'][event_id]
-        masked_role = event_data['roles'][role_slot_idx]
-        role_name = masked_role['role']
-        target_entity_id = masked_role['entity_id']
-        verb = event_data['event_type']
+    with open(output_file, 'wb') as f:
+        pickle.dump(output, f)
 
-        context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
-        if self.training:
-            noise = torch.randn_like(context) * self.config.noise_std
-            context = context + noise
-
-        pred = self._predict_filler(context, role_name)   # (hidden_dim,)
-        pos_emb = self._get_entity_embedding(target_entity_id)
-
-        # Mix of hard and random negatives
-        hard_pool = self.role_entity_map.get((verb, role_name), [])
-        hard_neg_ids = [eid for eid in hard_pool if eid != target_entity_id]
-        random_pool = [eid for eid in self.all_entity_ids if eid != target_entity_id and eid not in hard_neg_ids]
-
-        num_hard = min(len(hard_neg_ids), self.config.num_negatives // 2)
-        num_random = self.config.num_negatives - num_hard
-
-        if len(hard_neg_ids) > num_hard:
-            sampled_hard = random.sample(hard_neg_ids, num_hard)
-        else:
-            sampled_hard = hard_neg_ids
-            num_random = self.config.num_negatives - len(sampled_hard)
-
-        if len(random_pool) > num_random:
-            sampled_random = random.sample(random_pool, num_random)
-        else:
-            sampled_random = random_pool
-
-        neg_ids = sampled_hard + sampled_random
-        if len(neg_ids) < 1:
-            neg_ids = random.sample([eid for eid in self.all_entity_ids if eid != target_entity_id],
-                                    min(self.config.num_negatives, len(self.all_entity_ids)-1))
-
-        neg_embs = torch.stack([self._get_entity_embedding(eid) for eid in neg_ids])  # (K, hidden_dim)
-
-        pred_norm = F.normalize(pred, dim=0)
-        pos_norm = F.normalize(pos_emb, dim=0)
-        neg_norm = F.normalize(neg_embs, dim=1)
-
-        pos_sim = torch.dot(pred_norm, pos_norm)
-        neg_sim = torch.mv(neg_norm, pred_norm)   # (K,)
-
-        logits = torch.cat([pos_sim.unsqueeze(0), neg_sim]) / self.config.temperature
-        labels = torch.zeros(1, dtype=torch.long, device=pred.device)
-        loss = F.cross_entropy(logits.unsqueeze(0), labels)
-        return loss
-
-    # ---- Surprise ----
-    def compute_role_surprise(self, event_id: int, role_slot_idx: int) -> float:
-        event_data = self.dataset['events'][event_id]
-        role_info = event_data['roles'][role_slot_idx]
-        if role_info['entity_id'] is None:
-            return 0.0
-        context = self._compose_context(event_data, exclude_role_slot=role_slot_idx)
-        pred = self._predict_filler(context, role_info['role'])
-        target = self._get_entity_embedding(role_info['entity_id'])
-        sim = F.cosine_similarity(pred.unsqueeze(0), target.unsqueeze(0)).item()
-        return 1 - sim
-
-    def get_event_surprises(self, event_id: int) -> Dict[int, float]:
-        event_data = self.dataset['events'][event_id]
-        surprises = {}
-        for i, role_info in enumerate(event_data['roles']):
-            if role_info['entity_id'] is not None:
-                surprises[i] = self.compute_role_surprise(event_id, i)
-        return surprises
+    print(f"\nSaved graph corpus to {output_file}")
+    print(f"Entities: {len(registry.entities)}, Events: {len(all_events)}, "
+          f"Unresolved pronoun mentions: {len(unresolved)}")
+    return output
 
 
 # --------------------------------------------------------------------
-# 3. TRAINING LOOP (same as before)
+# 6. SELF-CHECKS (unchanged)
 # --------------------------------------------------------------------
-def train_graph_peg(model: GraphPEGModel, dataset: Dict[str, Any], epochs=150):
-    optimizer = torch.optim.Adam(model.parameters(),
-                                 lr=model.config.lr,
-                                 weight_decay=model.config.weight_decay)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.7)   # slower decay
+def run_self_checks(output, is_demo_corpus=True):
+    if not is_demo_corpus:
+        print("\n(Self-checks skipped — not the demo corpus. "
+              "Inspect the event dump manually instead.)")
+        return True
 
-    events = dataset['events']
-    maskable_slots = {}
-    for eid, ev in enumerate(events):
-        slots = [i for i, r in enumerate(ev['roles']) if r['entity_id'] is not None]
-        if slots:
-            maskable_slots[eid] = slots
-
-    trainable_event_ids = list(maskable_slots.keys())
-    if not trainable_event_ids:
-        print("No events have a maskable role — nothing to train on.")
-        return
-
-    batch_size = model.config.batch_size
-    for epoch in range(epochs):
-        random.shuffle(trainable_event_ids)
-        total_loss = 0.0
-        n_steps = 0
-        optimizer.zero_grad()
-
-        for i, eid in enumerate(trainable_event_ids):
-            slots = maskable_slots[eid]
-            role_slot_idx = random.choice(slots)
-            loss = model.compute_loss(eid, role_slot_idx)
-            loss = loss / batch_size
-            loss.backward()
-
-            if (i + 1) % batch_size == 0 or (i + 1) == len(trainable_event_ids):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                total_loss += loss.item() * batch_size
-                n_steps += 1
-
-        avg_loss = total_loss / max(n_steps, 1)
-        print(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f}")
-        scheduler.step()
-
-    print("Training complete.")
-
-
-# --------------------------------------------------------------------
-# 4. SANITY CHECKS (unchanged)
-# --------------------------------------------------------------------
-def run_sanity_checks(model: GraphPEGModel, dataset: Dict[str, Any]):
-    events = dataset['events']
+    events = output['events']
     by_type = {}
     for e in events:
         by_type.setdefault(e['event_type'], []).append(e)
-    repeated_verbs = {k: v for k, v in by_type.items() if len(v) >= 2}
-    if not repeated_verbs:
-        print("\nNo repeated verb – cannot demonstrate surprise.")
-        return
-    verb = 'hit' if 'hit' in repeated_verbs else next(iter(repeated_verbs))
-    pair = repeated_verbs[verb][:2]
 
-    print(f"\n--- Surprise-based demonstration (Option C) ---")
-    print(f"Using verb: '{verb}'")
-    for i, ev in enumerate(pair):
-        sentence = ev['metadata']['sentence']
-        surprises = model.get_event_surprises(ev['event_id'])
-        avg_surprise = sum(surprises.values()) / len(surprises) if surprises else 0.0
-        print(f"  Event {i+1}: {sentence!r}")
-        print(f"    Average surprise: {avg_surprise:.4f}")
-        for slot, val in surprises.items():
-            role = ev['roles'][slot]['role']
-            filler = dataset['entities'][ev['roles'][slot]['entity_id']]['canonical_text']
-            print(f"      {role}={filler}: surprise={val:.4f}")
-        print()
+    errors = []
+    # Check for 'chase' event (relative clause test)
+    if 'chase' not in by_type:
+        errors.append("Expected an event for 'chase' (from 'chased').")
+    else:
+        chase_roles = by_type['chase'][0]['roles']
+        agent_roles = [r for r in chase_roles if r['role'] == 'AGENT']
+        if not agent_roles:
+            errors.append("'chase' event has no AGENT.")
+        else:
+            agent_id = agent_roles[0]['entity_id']
+            agent_text = output['entities'][agent_id]['canonical_text'].lower() if agent_id is not None else None
+            if agent_text not in ('that', 'which', 'who', 'whom') and agent_text != 'cat':
+                errors.append(f"'chase' AGENT is '{agent_text}', expected 'cat'.")
 
-    print("Interpretation:")
-    print("  - Low surprise means the predictor could guess the filler from context.")
-    print("  - High surprise means the filler was unexpected (novel event).")
-    print("  - This avoids relying on pooled event vectors for similarity.")
+    if 'give' not in by_type:
+        errors.append("Expected an event for 'give'.")
+    else:
+        roles_present = {r['role'] for r in by_type['give'][0]['roles']}
+        if 'RECIPIENT' not in roles_present:
+            errors.append("'give' has no RECIPIENT.")
+        if 'PATIENT' not in roles_present:
+            errors.append("'give' has no PATIENT.")
+
+    if errors:
+        print("\n*** SELF-CHECK FAILURES ***")
+        for err in errors:
+            print(f"  - {err}")
+        return False
+    else:
+        print("\nSelf-checks passed.")
+        return True
 
 
 # --------------------------------------------------------------------
-# 5. NOVELTY TEST (unchanged)
+# 7. DUMP EVENTS
 # --------------------------------------------------------------------
-def test_novelty(model: GraphPEGModel, dataset: Dict[str, Any]):
-    import spacy
-    from sentence_transformers import SentenceTransformer
-
-    print("\n" + "="*60)
-    print("NOVELTY TEST (Option C in action)")
-    print("="*60)
-
-    nlp = spacy.load('en_core_web_sm')
-    encoder = SentenceTransformer('all-MiniLM-L6-v2')
-
-    def compute_surprise_for_new_event(event_type: str, roles: List[Dict]):
-        with torch.no_grad():
-            if event_type in model.event_type_to_idx:
-                verb_vec = model._get_event_type_embedding(event_type)
-                verb_status = "KNOWN"
+def dump_events(output):
+    print("\n=== FULL EVENT DUMP ===")
+    for e in output['events']:
+        role_strs = []
+        for r in e['roles']:
+            if r['entity_id'] is None:
+                filler = '(flag)'
             else:
-                verb_vec = torch.zeros(model.config.hidden_dim, device=model.config.device)
-                verb_status = "NEW (using zero)"
-            print(f"  Verb: '{event_type}' [{verb_status}]")
-
-            entity_projs = {}
-            for r in roles:
-                text = r['entity_text']
-                raw_emb = encoder.encode([text], convert_to_tensor=True).squeeze(0)
-                raw_emb = raw_emb.clone()
-                proj_emb = model.entity_proj(raw_emb.to(model.config.device))
-                entity_projs[text] = proj_emb
-
-            surprises = {}
-            for i, r in enumerate(roles):
-                role_sum = torch.zeros(model.config.hidden_dim, device=model.config.device)
-                for j, other in enumerate(roles):
-                    if i == j:
-                        continue
-                    role_emb = model.role_proj(model._get_role_embedding(other['role']))
-                    entity_emb = entity_projs[other['entity_text']]
-                    role_sum = role_sum + role_emb * entity_emb
-                context_vec = model.config.verb_weight * verb_vec + (1 - model.config.verb_weight) * role_sum
-
-                pred = model._predict_filler(context_vec, r['role'])
-                target = entity_projs[r['entity_text']]
-                sim = F.cosine_similarity(pred.unsqueeze(0), target.unsqueeze(0)).item()
-                surprise = 1 - sim
-                surprises[r['role']] = surprise
-
-            return surprises, verb_status
-
-    # --- Test 1 ---
-    print("\n--- Test 1: Known verb 'be' + NEW modifier 'carpenter' ---")
-    new_sentence1 = "Leo was a carpenter."
-    doc1 = nlp(new_sentence1)
-    root1 = [t for t in doc1 if t.dep_ == 'ROOT'][0]
-    event_type1 = root1.lemma_
-    roles1 = []
-    for child in root1.children:
-        if child.dep_ == 'nsubj':
-            roles1.append({'role': 'AGENT', 'entity_text': child.text})
-        elif child.dep_ in ('attr', 'acomp'):
-            # v18 FIX: this used to emit 'MODIFIER', which was correct for
-            # the v1-v8 preprocessor but is now stale — preprocess.py v9
-            # gives attr/acomp their own ATTRIBUTE role (see that file's
-            # changelog). Leaving this as MODIFIER would silently test
-            # against a role-mapping rule the real pipeline no longer
-            # uses, making this novelty test unrepresentative of current
-            # training data.
-            roles1.append({'role': 'ATTRIBUTE', 'entity_text': child.text})
-    print(f"  Sentence: {new_sentence1!r}")
-    surprises1, status1 = compute_surprise_for_new_event(event_type1, roles1)
-    for role, val in surprises1.items():
-        print(f"    {role}: surprise={val:.4f}")
-
-    # --- Test 2 ---
-    print("\n--- Test 2: NEW verb 'dance' + known filler 'John' ---")
-    new_sentence2 = "John danced."
-    doc2 = nlp(new_sentence2)
-    root2 = [t for t in doc2 if t.dep_ == 'ROOT'][0]
-    event_type2 = root2.lemma_
-    roles2 = []
-    for child in root2.children:
-        if child.dep_ == 'nsubj':
-            roles2.append({'role': 'AGENT', 'entity_text': child.text})
-    print(f"  Sentence: {new_sentence2!r}")
-    surprises2, status2 = compute_surprise_for_new_event(event_type2, roles2)
-    for role, val in surprises2.items():
-        print(f"    {role}: surprise={val:.4f}")
-
-    # --- Test 3 ---
-    print("\n--- Test 3: NEW verb 'arrive' + NEW entities 'Zorp' and 'alien' ---")
-    new_sentence3 = "Zorp the alien arrived."
-    event_type3 = "arrive"
-    # NOTE: MODIFIER is correct here, unlike Test 1's old bug — "alien" is
-    # an appositive modifying "Zorp", not a copula complement (there's no
-    # attr/acomp dependency here; "arrive" isn't a copula verb). The v9
-    # preprocess.py fix only redirected attr/acomp -> ATTRIBUTE; it left
-    # appositives and amod-style modifiers under MODIFIER, since no better
-    # role exists for them yet.
-    roles3 = [
-        {'role': 'AGENT', 'entity_text': 'Zorp'},
-        {'role': 'MODIFIER', 'entity_text': 'alien'}
-    ]
-    print(f"  Sentence: {new_sentence3!r}")
-    print(f"  Extracted roles: {[(r['role'], r['entity_text']) for r in roles3]}")
-    surprises3, status3 = compute_surprise_for_new_event(event_type3, roles3)
-    for role, val in surprises3.items():
-        print(f"    {role}: surprise={val:.4f}")
-
-    # --- Interpretation ---
-    print("\n--- Interpretation ---")
-    # v19 FIX: Test 1 now extracts role 'ATTRIBUTE' (see fix above), so the
-    # lookup key here must match — this was still reading 'MODIFIER' and
-    # would have silently printed 0.0 every run via the .get() fallback,
-    # which is a much worse failure mode than a KeyError: it looks like a
-    # real (and suspiciously perfect) result instead of an obvious bug.
-    print(f"  Test 1 (carpenter): ATTRIBUTE surprise = {surprises1.get('ATTRIBUTE', 0.0):.4f}")
-    print(f"  Test 2 (dance):    AGENT surprise    = {surprises2.get('AGENT', 0.0):.4f}")
-    print(f"  Test 3 (Zorp):     AGENT surprise    = {surprises3.get('AGENT', 0.0):.4f}")
-    print(f"  Test 3 (alien):    MODIFIER surprise = {surprises3.get('MODIFIER', 0.0):.4f}")
-    print()
-    print("  Expected: Test 1 < 0.2 (known verb, new modifier should generalise).")
-    print("            Test 2 > 0.2 (new verb, surprise should be moderate).")
-    print("            Test 3 > 0.3 (completely new event – highest surprise).")
+                filler = output['entities'][r['entity_id']]['canonical_text']
+            # Show source and weight for debugging
+            src = r.get('source', '?')
+            wt = r.get('weight', 1.0)
+            role_strs.append(f"{r['role']}={filler}(src={src},wt={wt:.2f})")
+        print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
+              f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")
 
 
 # --------------------------------------------------------------------
-# 6. MAIN
+# 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    import sys
-    print(">>> RUNNING graph_peg.py VERSION: v19-add-attribute-role <<<")
+    print(">>> RUNNING preprocess.py VERSION: v9-provenance <<<")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--debug', action='store_true',
+                         help='Print full dependency parse for every sentence')
+    parser.add_argument('--corpus-file', type=str, default=None,
+                         help='Path to a text file with one sentence per line. '
+                              'If omitted, runs the 5-sentence demo corpus.')
+    parser.add_argument('--output', type=str, default=None,
+                         help='Output pickle path.')
+    args = parser.parse_args()
 
-    if len(sys.argv) < 2:
-        print("Usage: python3 graph_peg_v17.py <graph_corpus.pkl> [epochs]")
-        sys.exit(1)
+    is_demo = args.corpus_file is None
 
-    epochs = int(sys.argv[2]) if len(sys.argv) > 2 else 150
+    if is_demo:
+        corpus = [
+            "John hit the ball.",
+            "The ball hit John.",
+            "Do you go to church on Sundays?",
+            "The cat that chased the mouse is black.",
+            "She gave him a book.",
+        ]
+        output_file = args.output or 'demo_graph_corpus.pkl'
+    else:
+        with open(args.corpus_file) as f:
+            corpus = [line.strip() for line in f if line.strip()]
+        output_file = args.output or (args.corpus_file.rsplit('.', 1)[0] + '_graph.pkl')
 
-    with open(sys.argv[1], 'rb') as f:
-        dataset = pickle.load(f)
-
-    print(f"Loaded {len(dataset['events'])} events, {len(dataset['entities'])} entities.")
-
-    config = GraphPEGConfig()
-    config.epochs = epochs
-    model = GraphPEGModel(config, dataset)
-
-    train_graph_peg(model, dataset, epochs=epochs)
-    run_sanity_checks(model, dataset)
-    test_novelty(model, dataset)
-    #-----------------------------
-    import torch
-
-    # After training, with the model in eval mode
-    model.eval()
-    with torch.no_grad():
-        preds = []
-        for event_id in range(50):  # sample of real training events
-            event_data = dataset['events'][event_id]
-            if not event_data['roles']:
-                continue
-            slot = 0
-            role = event_data['roles'][slot]['role']
-            context = model._compose_context(event_data, exclude_role_slot=slot)
-            pred = model._predict_filler(context, role)
-            preds.append(pred)
-
-        preds = torch.stack(preds)
-        preds_norm = torch.nn.functional.normalize(preds, dim=1)
-        sim_matrix = preds_norm @ preds_norm.T
-        n = sim_matrix.shape[0]
-        off_diag_mean = (sim_matrix.sum() - n) / (n * n - n)
-        print(f"Mean pairwise cosine similarity across {n} DIFFERENT events' predictions: {off_diag_mean:.4f}")
-        print(f"Prediction vector norm (mean): {preds.norm(dim=1).mean():.4f}, std: {preds.norm(dim=1).std():.4f}")
+    output = preprocess(corpus, output_file=output_file, debug=args.debug)
+    ok = run_self_checks(output, is_demo_corpus=is_demo)
+    dump_events(output)
+    sys.exit(0 if ok else 1)

@@ -49,17 +49,93 @@ def load_graph(path):
 # STATE
 # --------------------------------------------------
 
-def get_state(event):
+def get_state_verb_only(event):
+    """
+    Level A (original): state is just the verb lemma.
+    """
     return event["event_type"]
+
+
+def get_state_verb_roles(event, min_confidence=0.0, include_polarity=False):
+    """
+    Level B: state is the verb plus the sorted set of distinct semantic
+    roles present on the event, e.g. "give(AGENT,PATIENT,RECIPIENT)".
+
+    - Deduplicates role labels (a conjunct AGENT doesn't add a second
+      AGENT slot to the state -- presence, not count, is what matters
+      here).
+    - min_confidence filters out low-confidence role attachments
+      (e.g. weak control/conj-inherited AGENTs) before building the
+      state, so speculative parses don't fragment the state space.
+    - POLARITY is excluded by default since it's closer to a modifier
+      on the event (negation) than a participant role, and including
+      it would double the state space for every verb without clearly
+      helping interpolation; set include_polarity=True to include it.
+    """
+
+    verb = event["event_type"]
+
+    role_labels = set()
+
+    for r in event.get("roles", []):
+
+        role = r.get("role")
+
+        if role is None:
+            continue
+
+        if role == "POLARITY" and not include_polarity:
+            continue
+
+        confidence = r.get("confidence", 1.0)
+
+        if confidence < min_confidence:
+            continue
+
+        role_labels.add(role)
+
+    if not role_labels:
+        return f"{verb}()"
+
+    return f"{verb}({','.join(sorted(role_labels))})"
+
+
+# Backwards-compatible default: existing callers of get_state() keep
+# the original verb-only behavior unchanged.
+def get_state(event):
+    return get_state_verb_only(event)
+
+
+def describe_state_vocab(events, state_fn, label=""):
+    """
+    Quick diagnostic: how many distinct states does this state_fn
+    produce over these events, and how skewed is the distribution?
+    Useful for sanity-checking that verb+roles doesn't fragment the
+    vocabulary so much that every state becomes a singleton.
+    """
+
+    states = [state_fn(e) for e in events]
+    counts = Counter(states)
+
+    vocab_size = len(counts)
+    singleton_count = sum(1 for c in counts.values() if c == 1)
+
+    print(f"\n[State vocab: {label or state_fn.__name__}]")
+    print(f"  Distinct states: {vocab_size}")
+    print(f"  Singleton states (count=1): {singleton_count} "
+          f"({100 * singleton_count / vocab_size:.1f}% of vocab)" if vocab_size else "")
+    print(f"  Top 10 states: {counts.most_common(10)}")
+
+    return counts
 
 
 # --------------------------------------------------
 # TRANSITIONS
 # --------------------------------------------------
 
-def build_transitions(events):
+def build_transitions(events, state_fn=get_state_verb_only):
 
-    states = [get_state(e) for e in events]
+    states = [state_fn(e) for e in events]
 
     trans = defaultdict(lambda: defaultdict(int))
 
@@ -289,7 +365,8 @@ def evaluate(
     events,
     train_ratio=0.8,
     lambda_variants=None,
-    candidate_set_fns=None
+    candidate_set_fns=None,
+    state_fn=get_state_verb_only
 ):
     """
     lambda_variants: dict of {label: lambda_e3}, e.g.
@@ -297,6 +374,13 @@ def evaluate(
 
     candidate_set_fns: dict of {label: fn(e1, e3, trans) -> set}, e.g.
         {"Union": candidate_set_union, "Intersection": candidate_set_intersection}.
+
+    state_fn: fn(event) -> state string. Determines the granularity of
+        states, e.g. get_state_verb_only (Level A) or
+        get_state_verb_roles (Level B). This is the main lever for the
+        "does richer state granularity help" question -- everything
+        else (candidate sets, scoring weights) stays comparable across
+        state_fn choices because the harness is identical.
 
     Every (candidate_set_label, lambda_label) combination is evaluated
     on the same train/test split, so differences are attributable to
@@ -322,13 +406,14 @@ def evaluate(
     test_events = events[split_idx:]
 
     trans, all_states, global_counts = build_transitions(
-        train_events
+        train_events,
+        state_fn=state_fn
     )
 
     vocab_size = len(all_states)
 
     test_states = [
-        get_state(e)
+        state_fn(e)
         for e in test_events
     ]
 
@@ -571,6 +656,14 @@ def main():
         default=0.8
     )
 
+    parser.add_argument(
+        "--min-role-confidence",
+        type=float,
+        default=0.0,
+        help="Minimum role confidence to include a role in the verb+roles "
+             "state (Level B). 0.0 keeps all roles regardless of confidence."
+    )
+
     args = parser.parse_args()
 
     graph = load_graph(
@@ -583,6 +676,23 @@ def main():
         f"Events: {len(events)}"
     )
 
+    # --------------------------------------------------
+    # State vocab diagnostics (cheap, run before any eval)
+    # --------------------------------------------------
+
+    def verb_roles_state(event):
+        return get_state_verb_roles(
+            event,
+            min_confidence=args.min_role_confidence
+        )
+
+    describe_state_vocab(events, get_state_verb_only, label="Level A: verb-only")
+    describe_state_vocab(events, verb_roles_state, label="Level B: verb+roles")
+
+    # --------------------------------------------------
+    # Shared experiment grid
+    # --------------------------------------------------
+
     lambda_variants = {
         "Full (lambda=1.0)": 1.0,
         "Partial (lambda=0.5)": 0.5,
@@ -594,125 +704,184 @@ def main():
         "Intersection": candidate_set_intersection,
     }
 
-    results = evaluate(
-        events,
-        args.train_ratio,
-        lambda_variants=lambda_variants,
-        candidate_set_fns=candidate_set_fns
-    )
+    state_levels = {
+        "Level A (verb-only)": get_state_verb_only,
+        "Level B (verb+roles)": verb_roles_state,
+    }
 
-    print(
-        f"\nTotal Queries: {results['total_queries']}"
-    )
+    all_results = {}
 
-    print("\n=== CANDIDATE SET COMPARISON ===\n")
+    for level_label, state_fn in state_levels.items():
 
-    cs_header = f"{'Candidate Set':<16}{'Coverage':>10}{'Avg Size':>10}{'Med Size':>10}"
-    print(cs_header)
-    print("-" * len(cs_header))
-
-    seen_cs = set()
-    for (cs_label, lam_label), v in results["combos"].items():
-        if cs_label in seen_cs:
-            continue
-        seen_cs.add(cs_label)
-        print(
-            f"{cs_label:<16}"
-            f"{v['candidate_coverage']:>10.4f}"
-            f"{v['avg_candidate_size']:>10.2f}"
-            f"{v['median_candidate_size']:>10.2f}"
+        all_results[level_label] = evaluate(
+            events,
+            args.train_ratio,
+            lambda_variants=lambda_variants,
+            candidate_set_fns=candidate_set_fns,
+            state_fn=state_fn
         )
 
-    print("\n=== SCORING ABLATION (per candidate set) ===")
-    print("(same train/test split within each candidate-set column)\n")
+    total_queries = next(iter(all_results.values()))["total_queries"]
+
+    print(
+        f"\nTotal Queries: {total_queries}"
+    )
+
+    # --------------------------------------------------
+    # Candidate set stats per state level
+    # --------------------------------------------------
+
+    for level_label, results in all_results.items():
+
+        print(f"\n=== CANDIDATE SET COMPARISON [{level_label}] ===\n")
+
+        cs_header = f"{'Candidate Set':<16}{'Coverage':>10}{'Avg Size':>10}{'Med Size':>10}"
+        print(cs_header)
+        print("-" * len(cs_header))
+
+        seen_cs = set()
+        for (cs_label, lam_label), v in results["combos"].items():
+            if cs_label in seen_cs:
+                continue
+            seen_cs.add(cs_label)
+            print(
+                f"{cs_label:<16}"
+                f"{v['candidate_coverage']:>10.4f}"
+                f"{v['avg_candidate_size']:>10.2f}"
+                f"{v['median_candidate_size']:>10.2f}"
+            )
+
+    # --------------------------------------------------
+    # Full scoring ablation per state level
+    # --------------------------------------------------
 
     header = f"{'Candidate Set':<14}{'Lambda Variant':<24}{'MRR@All':>10}{'MRR@Rec':>10}{'Top-1':>8}{'Top-5':>8}{'Recov.':>9}"
-    print(header)
-    print("-" * len(header))
 
-    for cs_label in candidate_set_fns:
-        for lam_label in lambda_variants:
-            v = results["combos"][(cs_label, lam_label)]
+    for level_label, results in all_results.items():
+
+        print(f"\n=== SCORING ABLATION [{level_label}] ===")
+        print("(same train/test split within each candidate-set column)\n")
+
+        print(header)
+        print("-" * len(header))
+
+        for cs_label in candidate_set_fns:
+            for lam_label in lambda_variants:
+                v = results["combos"][(cs_label, lam_label)]
+                print(
+                    f"{cs_label:<14}"
+                    f"{lam_label:<24}"
+                    f"{v['mrr_all']:>10.4f}"
+                    f"{v['mrr_recoverable']:>10.4f}"
+                    f"{v['top1']:>8.4f}"
+                    f"{v['top5']:>8.4f}"
+                    f"{v['recoverability']:>9.4f}"
+                )
+            print()
+
+        print(f"Baselines [{level_label}] (per candidate set, MRR@All-equivalent)")
+        print("-" * len(header))
+
+        for cs_label in candidate_set_fns:
+            b = results["baselines"][cs_label]
+            print(f"\n[{cs_label}]")
             print(
-                f"{cs_label:<14}"
-                f"{lam_label:<24}"
-                f"{v['mrr_all']:>10.4f}"
-                f"{v['mrr_recoverable']:>10.4f}"
-                f"{v['top1']:>8.4f}"
-                f"{v['top5']:>8.4f}"
-                f"{v['recoverability']:>9.4f}"
+                f"  {'Random (full vocab)':<28}{b['random_mrr']:>10.4f}"
+                "  <- NOT comparable (ranks full vocab)"
             )
-        print()
+            print(
+                f"  {'Random (candidates)':<28}{b['random_mrr_within_candidates']:>10.4f}"
+                "  <- fair floor for this column"
+            )
+            print(
+                f"  {'Global Frequency':<28}{b['global_freq_mrr']:>10.4f}"
+                "  (ignores e1 and e3)"
+            )
+            print(
+                f"  {'Most Common Successor':<28}{b['mcs_mrr']:>10.4f}"
+                "  (ignores e3)"
+            )
 
-    print("Baselines (per candidate set, MRR@All-equivalent)")
-    print("-" * header.__len__())
+    # --------------------------------------------------
+    # Head-to-head: Level A vs Level B, best config each
+    # --------------------------------------------------
 
-    for cs_label in candidate_set_fns:
-        b = results["baselines"][cs_label]
-        print(f"\n[{cs_label}]")
-        print(
-            f"  {'Random (full vocab)':<28}{b['random_mrr']:>10.4f}"
-            "  <- NOT comparable (ranks full vocab)"
+    print("\n\n=== HEAD-TO-HEAD: Level A vs Level B ===")
+    print("(best MRR@All config found for each state level, vs. that level's own baselines)\n")
+
+    summary_header = f"{'State Level':<22}{'Best Config':<34}{'MRR@All':>10}  {'Best Baseline':<26}{'Baseline MRR':>14}  {'Delta':>8}"
+    print(summary_header)
+    print("-" * len(summary_header))
+
+    for level_label, results in all_results.items():
+
+        best_combo_key = max(
+            results["combos"],
+            key=lambda k: results["combos"][k]["mrr_all"]
         )
+        best_mrr = results["combos"][best_combo_key]["mrr_all"]
+        best_config_label = f"{best_combo_key[0]} / {best_combo_key[1]}"
+
+        # Best baseline across both candidate sets for this level
+        best_baseline_label = None
+        best_baseline_mrr = -1.0
+        for cs_label, b in results["baselines"].items():
+            for bname, bval in [
+                ("Global Frequency", b["global_freq_mrr"]),
+                ("Most Common Successor", b["mcs_mrr"]),
+            ]:
+                if bval > best_baseline_mrr:
+                    best_baseline_mrr = bval
+                    best_baseline_label = f"{bname} [{cs_label}]"
+
+        delta = best_mrr - best_baseline_mrr
+
         print(
-            f"  {'Random (candidates)':<28}{b['random_mrr_within_candidates']:>10.4f}"
-            "  <- fair floor for this column"
-        )
-        print(
-            f"  {'Global Frequency':<28}{b['global_freq_mrr']:>10.4f}"
-            "  (ignores e1 and e3)"
-        )
-        print(
-            f"  {'Most Common Successor':<28}{b['mcs_mrr']:>10.4f}"
-            "  (ignores e3; NOTE: ranked over e1's full successor list,"
-            " not restricted to this candidate set -- same across both columns)"
+            f"{level_label:<22}"
+            f"{best_config_label:<34}"
+            f"{best_mrr:>10.4f}  "
+            f"{best_baseline_label:<26}"
+            f"{best_baseline_mrr:>14.4f}  "
+            f"{delta:>+8.4f}"
         )
 
     print(
-        "\nRead this as: compare each candidate-set block's best lambda row "
-        "against its own 'Random (candidates)' floor and against "
-        "'Most Common Successor'. If Intersection's best row clears "
-        "Most Common Successor by a real margin (even with lower recoverability), "
-        "that's a structural win worth keeping over the wider Union set."
+        "\nThe Delta column is the number that's actually comparable across "
+        "state levels (raw MRR is not, since vocab size and chance levels "
+        "differ). A more positive Delta for Level B than Level A means "
+        "verb+roles is beating its own naive baseline by more than verb-only "
+        "beats its own -- that's the real evidence richer states help, not "
+        "just a difference in absolute MRR."
     )
 
-    print("\nExamples (Union, Full variant)")
+    print(
+        "\nRead this as: if Level B's best config clears its own best baseline "
+        "by a real margin -- something Level A could not do across any "
+        "candidate-set or lambda combination tried so far -- that's the first "
+        "solid evidence that richer state granularity helps. If Level B's "
+        "gap over its baseline looks the same (or worse) than Level A's, "
+        "the extra state granularity isn't paying for itself yet, possibly "
+        "because verb+roles fragments the transition table faster than it "
+        "disambiguates it -- check the vocab diagnostics above for how much "
+        "the vocab size grew and how many states became singletons."
+    )
 
-    for ex in results["combos"][("Union", "Full (lambda=1.0)")]["examples"]:
+    print("\nExamples (Level B, Union, Full variant)")
 
-        print(
-            f"\n{ex['e1']} -> ? -> {ex['e3']}"
-        )
+    level_b_results = all_results["Level B (verb+roles)"]
+    examples = level_b_results["combos"][("Union", "Full (lambda=1.0)")]["examples"]
 
-        print(
-            f"True: {ex['e2_true']} "
-            f"(rank={ex['rank']})"
-        )
-
-        print(
-            "Top predictions:",
-            ex["top_predictions"]
-        )
-
-    print("\nExamples (Intersection, Full variant)")
-
-    intersection_examples = results["combos"][("Intersection", "Full (lambda=1.0)")]["examples"]
-
-    if not intersection_examples:
-        print("(no recoverable examples captured -- intersection candidate "
-              "sets may be empty or rarely contain the true e2 in this run)")
+    if not examples:
+        print("(no recoverable examples captured)")
     else:
-        for ex in intersection_examples:
-
+        for ex in examples:
             print(
                 f"\n{ex['e1']} -> ? -> {ex['e3']}"
             )
-
             print(
                 f"True: {ex['e2_true']} "
                 f"(rank={ex['rank']})"
             )
-
             print(
                 "Top predictions:",
                 ex["top_predictions"]

@@ -155,7 +155,10 @@ def random_rank_baseline(
 
     random.shuffle(candidates)
 
-    return candidates.index(true_state) + 1
+    try:
+        return candidates.index(true_state) + 1
+    except ValueError:
+        return len(all_states) + 1
 
 
 def global_frequency_baseline(
@@ -344,7 +347,7 @@ def evaluate(
             global_counts
         )
 
-        if r:
+        if r is not None:
             global_rr.append(1.0 / r)
 
         # Most common successor baseline
@@ -355,7 +358,7 @@ def evaluate(
             trans
         )
 
-        if r:
+        if r is not None:
             mcs_rr.append(1.0 / r)
 
     mrr_all = (

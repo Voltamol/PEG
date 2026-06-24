@@ -118,8 +118,16 @@ def score_candidate(
     e1,
     e3,
     trans,
-    vocab_size
+    vocab_size,
+    lambda_e3=1.0
 ):
+    """
+    score(E2) = log P(E2 | E1)  +  lambda_e3 * log P(E3 | E2)
+
+    lambda_e3 = 1.0  -> original two-term score
+    lambda_e3 = 0.0  -> e1-only score (ignores e3 entirely)
+    0 < lambda_e3 < 1 -> partial weighting of the e3 term
+    """
 
     p1 = p_next(
         candidate,
@@ -128,18 +136,20 @@ def score_candidate(
         vocab_size
     )
 
-    p2 = p_next(
-        e3,
-        candidate,
-        trans,
-        vocab_size
-    )
+    log_score = math.log(p1 + 1e-12)
 
-    return (
-        math.log(p1 + 1e-12)
-        +
-        math.log(p2 + 1e-12)
-    )
+    if lambda_e3 != 0.0:
+
+        p2 = p_next(
+            e3,
+            candidate,
+            trans,
+            vocab_size
+        )
+
+        log_score += lambda_e3 * math.log(p2 + 1e-12)
+
+    return log_score
 
 
 # --------------------------------------------------
@@ -250,8 +260,19 @@ def most_common_successor_baseline(
 
 def evaluate(
     events,
-    train_ratio=0.8
+    train_ratio=0.8,
+    lambda_variants=None
 ):
+    """
+    lambda_variants: dict of {label: lambda_e3} to evaluate side by side,
+    e.g. {"full (lambda=1.0)": 1.0, "e1-only (lambda=0.0)": 0.0}.
+    All variants share the same train/test split and candidate sets,
+    so differences in MRR are attributable purely to the scoring
+    function, not to data variation.
+    """
+
+    if lambda_variants is None:
+        lambda_variants = {"full (lambda=1.0)": 1.0}
 
     split_idx = int(
         len(events) * train_ratio
@@ -271,23 +292,26 @@ def evaluate(
         for e in test_events
     ]
 
-    reciprocal_ranks = []
-    reciprocal_ranks_recoverable = []
-
-    top1 = 0
-    top5 = 0
+    # Per-variant accumulators
+    variant_stats = {
+        label: {
+            "reciprocal_ranks": [],
+            "reciprocal_ranks_recoverable": [],
+            "top1": 0,
+            "top5": 0,
+            "recoverable": 0,
+            "examples": []
+        }
+        for label in lambda_variants
+    }
 
     candidate_generated = 0
-    recoverable = 0
-
     candidate_sizes = []
 
     random_rr = []
     random_rr_within_candidates = []
     global_rr = []
     mcs_rr = []
-
-    examples = []
 
     total_queries = 0
 
@@ -317,61 +341,68 @@ def evaluate(
             len(candidates)
         )
 
-        scored = []
+        # Score every candidate once per variant, sharing the same
+        # candidate set across variants for a fair comparison.
+        for label, lam in lambda_variants.items():
 
-        for cand in candidates:
+            scored = []
 
-            s = score_candidate(
-                cand,
-                e1,
-                e3,
-                trans,
-                vocab_size
+            for cand in candidates:
+
+                s = score_candidate(
+                    cand,
+                    e1,
+                    e3,
+                    trans,
+                    vocab_size,
+                    lambda_e3=lam
+                )
+
+                scored.append(
+                    (cand, s)
+                )
+
+            scored.sort(
+                key=lambda x: -x[1]
             )
 
-            scored.append(
-                (cand, s)
-            )
+            ranked_states = [
+                c for c, _
+                in scored
+            ]
 
-        scored.sort(
-            key=lambda x: -x[1]
-        )
+            stats = variant_stats[label]
 
-        ranked_states = [
-            c for c, _
-            in scored
-        ]
+            if e2 in ranked_states:
 
-        if e2 in ranked_states:
+                stats["recoverable"] += 1
 
-            recoverable += 1
+                rank = (
+                    ranked_states.index(e2)
+                    + 1
+                )
 
-            rank = (
-                ranked_states.index(e2)
-                + 1
-            )
+                rr = 1.0 / rank
 
-            rr = 1.0 / rank
+                stats["reciprocal_ranks"].append(rr)
+                stats["reciprocal_ranks_recoverable"].append(rr)
 
-            reciprocal_ranks.append(rr)
-            reciprocal_ranks_recoverable.append(rr)
+                if rank == 1:
+                    stats["top1"] += 1
 
-            if rank == 1:
-                top1 += 1
+                if rank <= 5:
+                    stats["top5"] += 1
 
-            if rank <= 5:
-                top5 += 1
+                if len(stats["examples"]) < 10:
 
-            if len(examples) < 10:
-
-                examples.append({
-                    "e1": e1,
-                    "e2_true": e2,
-                    "e3": e3,
-                    "rank": rank,
-                    "top_predictions":
-                        ranked_states[:5]
-                })
+                    stats["examples"].append({
+                        "e1": e1,
+                        "e2_true": e2,
+                        "e3": e3,
+                        "rank": rank,
+                        "top_predictions":
+                            ranked_states[:5]
+                    })
 
         # Random ranking baseline (full vocabulary -- NOT a fair
         # comparison to the model, which only ranks the candidate set;
@@ -422,19 +453,32 @@ def evaluate(
         if r is not None:
             mcs_rr.append(1.0 / r)
 
-    mrr_all = (
-        sum(reciprocal_ranks)
-        / total_queries
-        if total_queries
-        else 0
-    )
+    variant_results = {}
 
-    mrr_recoverable = (
-        sum(reciprocal_ranks_recoverable)
-        / recoverable
-        if recoverable
-        else 0
-    )
+    for label, stats in variant_stats.items():
+
+        mrr_all = (
+            sum(stats["reciprocal_ranks"])
+            / total_queries
+            if total_queries
+            else 0
+        )
+
+        mrr_recoverable = (
+            sum(stats["reciprocal_ranks_recoverable"])
+            / stats["recoverable"]
+            if stats["recoverable"]
+            else 0
+        )
+
+        variant_results[label] = {
+            "mrr_all": mrr_all,
+            "mrr_recoverable": mrr_recoverable,
+            "top1": stats["top1"] / total_queries if total_queries else 0,
+            "top5": stats["top5"] / total_queries if total_queries else 0,
+            "recoverability": stats["recoverable"] / total_queries if total_queries else 0,
+            "examples": stats["examples"]
+        }
 
     return {
 
@@ -444,22 +488,6 @@ def evaluate(
         "candidate_coverage":
             candidate_generated
             / total_queries,
-
-        "recoverability":
-            recoverable
-            / total_queries,
-
-        "mrr_all":
-            mrr_all,
-
-        "mrr_recoverable":
-            mrr_recoverable,
-
-        "top1":
-            top1 / total_queries,
-
-        "top5":
-            top5 / total_queries,
 
         "avg_candidate_size":
             mean(candidate_sizes)
@@ -485,8 +513,8 @@ def evaluate(
             mean(mcs_rr)
             if mcs_rr else 0,
 
-        "examples":
-            examples
+        "variants":
+            variant_results
     }
 
 
@@ -521,9 +549,16 @@ def main():
         f"Events: {len(events)}"
     )
 
+    lambda_variants = {
+        "Full (e1 + e3, lambda=1.0)": 1.0,
+        "Partial (e1 + 0.5*e3)": 0.5,
+        "e1-only (lambda=0.0)": 0.0,
+    }
+
     results = evaluate(
         events,
-        args.train_ratio
+        args.train_ratio,
+        lambda_variants=lambda_variants
     )
 
     print("\n=== RESULTS ===\n")
@@ -536,26 +571,6 @@ def main():
         f"Candidate Coverage:   {results['candidate_coverage']:.4f}"
     )
 
-    print(
-        f"Recoverability:       {results['recoverability']:.4f}"
-    )
-
-    print(
-        f"MRR@All:              {results['mrr_all']:.4f}"
-    )
-
-    print(
-        f"MRR@Recoverable:      {results['mrr_recoverable']:.4f}"
-    )
-
-    print(
-        f"Top-1:                {results['top1']:.4f}"
-    )
-
-    print(
-        f"Top-5:                {results['top5']:.4f}"
-    )
-
     print("\nCandidate Statistics")
 
     print(
@@ -566,31 +581,57 @@ def main():
         f"Median Size:          {results['median_candidate_size']:.2f}"
     )
 
-    print("\nBaselines")
+    print("\n=== SCORING ABLATION ===")
+    print("(same train/test split and candidate sets across all rows)\n")
+
+    header = f"{'Variant':<32}{'MRR@All':>10}{'MRR@Rec':>10}{'Top-1':>8}{'Top-5':>8}{'Recov.':>9}"
+    print(header)
+    print("-" * len(header))
+
+    for label, v in results["variants"].items():
+        print(
+            f"{label:<32}"
+            f"{v['mrr_all']:>10.4f}"
+            f"{v['mrr_recoverable']:>10.4f}"
+            f"{v['top1']:>8.4f}"
+            f"{v['top5']:>8.4f}"
+            f"{v['recoverability']:>9.4f}"
+        )
+
+    print("\nBaselines (for the same row format, MRR@All-equivalent)")
+    print("-" * len(header))
 
     print(
-        f"Random (full vocab):  {results['random_mrr']:.4f}"
-        "   <- NOT comparable to model (ranks full vocab, not candidate set)"
+        f"{'Random (full vocab)':<32}{results['random_mrr']:>10.4f}"
+        "   <- NOT comparable (ranks full vocab, not candidate set)"
     )
 
     print(
-        f"Random (candidates):  {results['random_mrr_within_candidates']:.4f}"
-        "   <- fair comparison to model's MRR"
+        f"{'Random (candidates)':<32}{results['random_mrr_within_candidates']:>10.4f}"
+        "   <- fair floor for MRR@All rows above"
     )
 
     print(
-        f"Global Frequency:     {results['global_freq_mrr']:.4f}"
-        "   (ranked over candidate set)"
+        f"{'Global Frequency':<32}{results['global_freq_mrr']:>10.4f}"
+        "   (ranked over candidate set, ignores e1 and e3)"
     )
 
     print(
-        f"Most Common Successor:{results['mcs_mrr']:.4f}"
-        "   (ranked over e1's successors only)"
+        f"{'Most Common Successor':<32}{results['mcs_mrr']:>10.4f}"
+        "   (ranked over e1's successors only, ignores e3)"
     )
 
-    print("\nExamples")
+    print(
+        "\nRead this as: if 'e1-only' beats 'Full', the e3 term is hurting "
+        "the ranking. If 'Full' barely beats 'Most Common Successor', the "
+        "model isn't using e1/e3 context beyond what raw frequency gives you."
+    )
 
-    for ex in results["examples"]:
+    print("\nExamples (Full variant)")
+
+    full_label = "Full (e1 + e3, lambda=1.0)"
+
+    for ex in results["variants"][full_label]["examples"]:
 
         print(
             f"\n{ex['e1']} -> ? -> {ex['e3']}"

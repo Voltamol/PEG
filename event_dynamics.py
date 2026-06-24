@@ -161,20 +161,56 @@ def random_rank_baseline(
         return len(all_states) + 1
 
 
+def random_rank_within_candidates_baseline(
+    true_state,
+    candidates
+):
+    """
+    Random ranking restricted to the same candidate set the model
+    actually ranks over. This is the fair baseline for MRR@All /
+    MRR@Recoverable -- the model never ranks the full vocabulary,
+    so comparing it to full-vocab random ranking overstates its lift.
+    """
+
+    cand_list = list(candidates)
+
+    random.shuffle(cand_list)
+
+    try:
+        return cand_list.index(true_state) + 1
+    except ValueError:
+        return len(cand_list) + 1
+
+
 def global_frequency_baseline(
     true_state,
-    global_counts
+    global_counts,
+    candidates
 ):
+    """
+    Rank the candidate set by global frequency (most frequent first)
+    and return the rank of true_state within that ordering.
 
-    if not global_counts:
+    States with zero global count (shouldn't normally happen, since
+    candidates are drawn from observed transitions) are pushed to the
+    back, tied at count 0.
+
+    Returns None only if the candidate set is empty.
+    """
+
+    if not candidates:
         return None
 
-    prediction = global_counts.most_common(1)[0][0]
+    ranked = sorted(
+        candidates,
+        key=lambda s: -global_counts.get(s, 0)
+    )
 
-    if prediction == true_state:
-        return 1
+    if true_state in ranked:
+        return ranked.index(true_state) + 1
 
-    return None
+    # true_state wasn't even in the candidate set -> miss
+    return len(ranked) + 1
 
 
 def most_common_successor_baseline(
@@ -182,22 +218,30 @@ def most_common_successor_baseline(
     true_state,
     trans
 ):
+    """
+    Rank e1's observed successors by transition count (most frequent
+    first) and return the rank of true_state within that ordering.
 
-    if e1 not in trans:
+    If e1 has no observed successors, or true_state never follows e1
+    in training, treat it as a miss: rank = (#successors + 1).
+    """
+
+    successors_counts = trans.get(e1)
+
+    if not successors_counts:
         return None
 
-    if not trans[e1]:
-        return None
+    ranked = sorted(
+        successors_counts.items(),
+        key=lambda x: -x[1]
+    )
 
-    prediction = max(
-        trans[e1].items(),
-        key=lambda x: x[1]
-    )[0]
+    ranked_states = [s for s, _ in ranked]
 
-    if prediction == true_state:
-        return 1
+    if true_state in ranked_states:
+        return ranked_states.index(true_state) + 1
 
-    return None
+    return len(ranked_states) + 1
 
 
 # --------------------------------------------------
@@ -239,6 +283,7 @@ def evaluate(
     candidate_sizes = []
 
     random_rr = []
+    random_rr_within_candidates = []
     global_rr = []
     mcs_rr = []
 
@@ -328,7 +373,9 @@ def evaluate(
                         ranked_states[:5]
                 })
 
-        # Random ranking baseline
+        # Random ranking baseline (full vocabulary -- NOT a fair
+        # comparison to the model, which only ranks the candidate set;
+        # kept for reference / comparison to the candidate-scoped version)
 
         rr_rand = (
             1.0 /
@@ -340,17 +387,31 @@ def evaluate(
 
         random_rr.append(rr_rand)
 
-        # Global frequency baseline
+        # Random ranking baseline, scoped to the same candidate set
+        # the model ranks over -- this is the fair comparison
+
+        rr_rand_cand = (
+            1.0 /
+            random_rank_within_candidates_baseline(
+                e2,
+                candidates
+            )
+        )
+
+        random_rr_within_candidates.append(rr_rand_cand)
+
+        # Global frequency baseline (full rank over candidate set)
 
         r = global_frequency_baseline(
             e2,
-            global_counts
+            global_counts,
+            candidates
         )
 
         if r is not None:
             global_rr.append(1.0 / r)
 
-        # Most common successor baseline
+        # Most common successor baseline (full rank over e1's successors)
 
         r = most_common_successor_baseline(
             e1,
@@ -411,6 +472,10 @@ def evaluate(
         "random_mrr":
             mean(random_rr)
             if random_rr else 0,
+
+        "random_mrr_within_candidates":
+            mean(random_rr_within_candidates)
+            if random_rr_within_candidates else 0,
 
         "global_freq_mrr":
             mean(global_rr)
@@ -504,15 +569,23 @@ def main():
     print("\nBaselines")
 
     print(
-        f"Random Ranking MRR:   {results['random_mrr']:.4f}"
+        f"Random (full vocab):  {results['random_mrr']:.4f}"
+        "   <- NOT comparable to model (ranks full vocab, not candidate set)"
+    )
+
+    print(
+        f"Random (candidates):  {results['random_mrr_within_candidates']:.4f}"
+        "   <- fair comparison to model's MRR"
     )
 
     print(
         f"Global Frequency:     {results['global_freq_mrr']:.4f}"
+        "   (ranked over candidate set)"
     )
 
     print(
         f"Most Common Successor:{results['mcs_mrr']:.4f}"
+        "   (ranked over e1's successors only)"
     )
 
     print("\nExamples")

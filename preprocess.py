@@ -1,6 +1,7 @@
+
 #!/usr/bin/env python3
-# preprocess.py — Graph‑PEG dataset generator, v17 (probabilistic coref)
-# VERSION MARKER: v17-prob-coref
+# preprocess.py — Graph‑PEG dataset generator, v18 (verb-class tagging + directive metadata)
+# VERSION MARKER: v18-verb-class
 
 import argparse
 import pickle
@@ -58,6 +59,97 @@ ROLE_POS_ALLOWED = {
     'ATTRIBUTE': {'ADJ', 'NOUN', 'PROPN'},
     'MODIFIER':  None,
     'POLARITY':  None,
+}
+
+# --------------------------------------------------------------------
+# 1b. VERB-CLASS LEXICON (v18)
+# --------------------------------------------------------------------
+VERB_CLASS_LEXICON = {
+    # Epistemic (world-state discovery / belief-update)
+    'notice': 'epistemic', 'realize': 'epistemic', 'know': 'epistemic',
+    'see': 'epistemic', 'hear': 'epistemic', 'spot': 'epistemic',
+    'recognize': 'epistemic', 'discover': 'epistemic', 'observe': 'epistemic',
+    'perceive': 'epistemic', 'learn': 'epistemic', 'understand': 'epistemic',
+    'believe': 'epistemic', 'think': 'epistemic', 'remember': 'epistemic',
+    'recall': 'epistemic', 'forget': 'epistemic', 'find': 'epistemic',
+    # Desiderative (goal-commitment, preference, intent)
+    'need': 'desiderative', 'suggest': 'desiderative', 'decide': 'desiderative',
+    'try': 'desiderative', 'manage': 'desiderative', 'want': 'desiderative',
+    'hope': 'desiderative', 'wish': 'desiderative', 'intend': 'desiderative',
+    'plan': 'desiderative', 'desire': 'desiderative', 'prefer': 'desiderative',
+    'choose': 'desiderative', 'aim': 'desiderative', 'seek': 'desiderative',
+    'attempt': 'desiderative', 'strive': 'desiderative',
+    # Communicative / directive (speech-acts that impose desire on others)
+    'tell': 'communicative', 'ask': 'communicative', 'order': 'communicative',
+    'persuade': 'communicative', 'convince': 'communicative', 'remind': 'communicative',
+    'warn': 'communicative', 'instruct': 'communicative', 'urge': 'communicative',
+    'command': 'communicative', 'demand': 'communicative', 'beg': 'communicative',
+    'request': 'communicative', 'plead': 'communicative', 'advise': 'communicative',
+    'recommend': 'communicative', 'encourage': 'communicative', 'forbid': 'communicative',
+    'prohibit': 'communicative', 'scold': 'communicative', 'praise': 'communicative',
+    # Physical / executed action
+    'walk': 'physical', 'cross': 'physical', 'build': 'physical', 'pack': 'physical',
+    'hack': 'physical', 'pick': 'physical', 'open': 'physical', 'place': 'physical',
+    'tear': 'physical', 'trip': 'physical', 'fall': 'physical', 'hit': 'physical',
+    'chase': 'physical', 'give': 'physical', 'run': 'physical', 'jump': 'physical',
+    'climb': 'physical', 'swim': 'physical', 'fly': 'physical', 'throw': 'physical',
+    'catch': 'physical', 'push': 'physical', 'pull': 'physical', 'lift': 'physical',
+    'break': 'physical', 'fix': 'physical', 'make': 'physical', 'create': 'physical',
+    'destroy': 'physical', 'take': 'physical', 'get': 'physical', 'go': 'physical',
+    'come': 'physical', 'leave': 'physical', 'enter': 'physical', 'return': 'physical',
+    'follow': 'physical', 'lead': 'physical', 'escape': 'physical', 'hide': 'physical',
+    'search': 'physical', 'grab': 'physical', 'hold': 'physical', 'carry': 'physical',
+    'drag': 'physical', 'cut': 'physical', 'slice': 'physical', 'dig': 'physical',
+    'fill': 'physical', 'empty': 'physical', 'close': 'physical', 'lock': 'physical',
+    'unlock': 'physical', 'turn': 'physical', 'move': 'physical', 'shake': 'physical',
+    'touch': 'physical', 'kick': 'physical', 'punch': 'physical', 'shoot': 'physical',
+    'stab': 'physical', 'kill': 'physical', 'heal': 'physical', 'help': 'physical',
+    'save': 'physical', 'fight': 'physical', 'attack': 'physical', 'defend': 'physical',
+    'win': 'physical', 'lose': 'physical', 'die': 'physical', 'live': 'physical',
+    'sleep': 'physical', 'wake': 'physical', 'eat': 'physical', 'drink': 'physical',
+    'cook': 'physical', 'burn': 'physical', 'freeze': 'physical', 'melt': 'physical',
+    'grow': 'physical', 'shrink': 'physical', 'change': 'physical', 'transform': 'physical',
+    'complain': 'physical', 'shout': 'physical', 'whisper': 'physical', 'yell': 'physical',
+    'cry': 'physical', 'laugh': 'physical', 'smile': 'physical', 'frown': 'physical',
+    'nod': 'physical', 'shake': 'physical', 'wave': 'physical', 'point': 'physical',
+    # Copula / attribute — refined dynamically into static vs dynamic
+    'be': 'copula', 'seem': 'copula', 'become': 'copula', 'appear': 'copula',
+    'remain': 'copula', 'stay': 'copula', 'look': 'copula', 'smell': 'copula',
+    'taste': 'copula', 'sound': 'copula', 'keep': 'copula',
+}
+
+# Fillers that signal scene-setting / static attribution when they appear
+# with copula in early sentences (e.g. "Leo is an adventurer")
+STATIC_ATTRIBUTE_FILLERS = {
+    'adventurer', 'friend', 'companion', 'hero', 'villain', 'king', 'queen',
+    'prince', 'princess', 'wizard', 'witch', 'knight', 'thief', 'merchant',
+    'peasant', 'soldier', 'captain', 'pirate', 'ninja', 'samurai', 'explorer',
+    'traveler', 'stranger', 'visitor', 'guest', 'host', 'servant', 'master',
+    'apprentice', 'student', 'teacher', 'mentor', 'guide', 'leader', 'follower',
+    'ally', 'enemy', 'rival', 'partner', 'spouse', 'parent', 'child', 'sibling',
+    'relative', 'neighbor', 'citizen', 'resident', 'native', 'foreigner',
+    'human', 'animal', 'creature', 'monster', 'beast', 'spirit', 'ghost',
+    'god', 'goddess', 'deity', 'angel', 'demon', 'elf', 'dwarf', 'orc',
+    'troll', 'goblin', 'fairy', 'dragon', 'phoenix', 'unicorn',
+    'man', 'woman', 'boy', 'girl', 'male', 'female',
+    'old', 'young', 'ancient', 'new', 'experienced', 'novice',
+    'brave', 'cowardly', 'fierce', 'gentle', 'wise', 'foolish',
+}
+
+# World-state / dynamic attribute fillers (newly discovered properties)
+DYNAMIC_ATTRIBUTE_FILLERS = {
+    'cold', 'hot', 'warm', 'cool', 'dark', 'bright', 'dim', 'quiet', 'loud',
+    'noisy', 'silent', 'covered', 'uncovered', 'open', 'closed', 'locked',
+    'unlocked', 'broken', 'fixed', 'repaired', 'dirty', 'clean', 'safe',
+    'dangerous', 'hazardous', 'steep', 'flat', 'deep', 'shallow', 'wide',
+    'narrow', 'tall', 'short', 'long', 'heavy', 'light', 'strong', 'weak',
+    'hard', 'soft', 'smooth', 'rough', 'sharp', 'dull', 'wet', 'dry',
+    'slippery', 'sticky', 'fuzzy', 'hairy', 'bald', 'furry', 'scaly',
+    'red', 'blue', 'green', 'yellow', 'black', 'white', 'brown', 'gray',
+    'grey', 'purple', 'orange', 'pink', 'gold', 'silver', 'bronze', 'copper',
+    'wooden', 'metal', 'stone', 'plastic', 'glass', 'golden', 'iron', 'steel',
+    'hidden', 'visible', 'invisible', 'secret', 'obvious', 'clear', 'murky',
+    'foggy', 'misty', 'cloudy', 'sunny', 'rainy', 'snowy', 'windy', 'stormy',
 }
 
 # --------------------------------------------------------------------
@@ -607,6 +699,16 @@ OBJECT_CONTROL_VERBS = {
     'convince', 'remind', 'warn', 'permit', 'instruct', 'urge',
 }
 
+# v18: subset of object-control verbs that are communicative speech-acts.
+# When these verbs embed an action via obj_control, the embedded event is
+# evidence about the SPEAKER'S desire, not the addressee's belief.
+COMMUNICATIVE_VERBS = {
+    'tell', 'ask', 'order', 'persuade', 'convince', 'remind', 'warn',
+    'instruct', 'urge', 'command', 'demand', 'beg', 'request', 'plead',
+    'advise', 'recommend', 'encourage', 'forbid', 'prohibit', 'scold',
+    'praise',
+}
+
 
 def find_predicate_tokens(doc):
     predicates = []
@@ -717,6 +819,32 @@ def has_local_negation(pred_token) -> bool:
         return True
 
     return False
+
+
+# v18: verb-class classifier
+def classify_verb(event_type: str, sent_idx: int, roles: List[Dict]) -> str:
+    """
+    Map a normalized event type to a coarse semantic class.
+    Copula ('be') is refined into attribute_static vs attribute_dynamic
+    based on sentence position and filler semantics.
+    """
+    base = VERB_CLASS_LEXICON.get(event_type, 'other')
+    if base != 'copula':
+        return base
+
+    # --- Copula refinement ---
+    for r in roles:
+        if r['role'] == 'ATTRIBUTE':
+            filler = r['entity_text'].lower().strip()
+            if filler in STATIC_ATTRIBUTE_FILLERS and sent_idx <= 2:
+                return 'attribute_static'
+            if filler in DYNAMIC_ATTRIBUTE_FILLERS:
+                return 'attribute_dynamic'
+
+    # Heuristic: very early sentences are likely scene-setting
+    if sent_idx <= 1:
+        return 'attribute_static'
+    return 'attribute_dynamic'
 
 
 def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
@@ -898,7 +1026,7 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
     # v16: use local negation detection (does not leak from embedded clauses)
     polarity = 'negative' if has_local_negation(pred_token) else 'positive'
 
-    return {
+    event = {
         'event_type': event_type,
         'roles': roles,
         'metadata': {
@@ -909,6 +1037,27 @@ def extract_event_for_predicate(pred_token, sent_idx, doc, feature_log=None):
         },
         'feature_log': feature_log,
     }
+
+    # v18: verb class tagging
+    verb_class = classify_verb(event_type, sent_idx, roles)
+    event['metadata']['verb_class'] = verb_class
+    for fl in feature_log:
+        fl['verb_class'] = verb_class
+
+    # v18: communicative directive metadata
+    # If this embedded verb got its agent via obj_control from a communicative
+    # matrix verb, annotate that the desire belongs to the speaker, not the addressee.
+    if pred_token.dep_ in ('xcomp', 'ccomp', 'advcl'):
+        matrix = pred_token.head
+        if matrix.lemma_.lower() in COMMUNICATIVE_VERBS:
+            matrix_subj = next((c for c in matrix.children if c.dep_ in ('nsubj', 'nsubjpass')), None)
+            matrix_dobj = next((c for c in matrix.children if c.dep_ == 'dobj'), None)
+            if matrix_subj is not None and matrix_dobj is not None:
+                event['metadata']['is_directive'] = True
+                event['metadata']['directive_source_text'] = matrix_subj.text
+                event['metadata']['directive_target_text'] = matrix_dobj.text
+
+    return event
 
 
 def extract_events(doc, sent_idx):
@@ -1156,7 +1305,7 @@ def run_self_checks(output, is_demo_corpus=True):
 
 
 # --------------------------------------------------------------------
-# 7. DUMP EVENTS (updated to show is_conjunct)
+# 7. DUMP EVENTS (updated to show is_conjunct and verb_class)
 # --------------------------------------------------------------------
 def dump_events(output):
     print("\n=== FULL EVENT DUMP ===")
@@ -1172,15 +1321,19 @@ def dump_events(output):
             conf = r.get('confidence', wt)
             conj = ' C' if r.get('is_conjunct', False) else ''
             role_strs.append(f"{r['role']}={filler}(src={src}{conj},wt={wt:.2f},conf={conf:.2f})")
-        print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)} "
-              f"| mood={e['metadata']['mood']} polarity={e['metadata']['polarity']}")
+        meta = e['metadata']
+        vc = meta.get('verb_class', '?')
+        extra = f" | mood={meta['mood']} polarity={meta['polarity']} class={vc}"
+        if meta.get('is_directive'):
+            extra += f" directive={meta['directive_source_text']}->{meta['directive_target_text']}"
+        print(f"  [{e['event_id']}] {e['event_type']}: {', '.join(role_strs)}{extra}")
 
 
 # --------------------------------------------------------------------
 # 8. MAIN
 # --------------------------------------------------------------------
 if __name__ == "__main__":
-    print(">>> RUNNING preprocess.py VERSION: v17-prob-coref <<<")
+    print(">>> RUNNING preprocess.py VERSION: v18-verb-class <<<")
     parser = argparse.ArgumentParser()
     parser.add_argument('--debug', action='store_true',
                          help='Print full dependency parse for every sentence')
